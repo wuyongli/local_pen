@@ -1,0 +1,49 @@
+{
+  "version": "2.17",
+  "children": [
+    {
+      "id": "quick-start",
+      "type": "frame",
+      "name": "待办清单",
+      "width": 360,
+      "height": 460,
+      "x": 0,
+      "y": 0,
+      "layout": "vertical",
+      "padding": 24,
+      "gap": 20,
+      "fill": "#F3F7F5",
+      "children": [
+        {
+          "id": "heading",
+          "type": "text",
+          "name": "标题",
+          "content": "待办清单",
+          "fontSize": 28,
+          "fontWeight": "600",
+          "fill": "#192B22"
+        },
+        {
+          "id": "confirm",
+          "type": "frame",
+          "name": "确认按钮",
+          "width": 144,
+          "height": 48,
+          "cornerRadius": 8,
+          "justifyContent": "center",
+          "alignItems": "center",
+          "fill": "#378B66",
+          "children": [
+            {
+              "id": "confirm-label",
+              "type": "text",
+              "content": "确认",
+              "fontSize": 16,
+              "fill": "#FFFFFF"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
