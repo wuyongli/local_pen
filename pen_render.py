@@ -18,6 +18,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory, gettempdir
 from time import monotonic
 from urllib.parse import urlsplit
+from xml.etree import ElementTree
 
 from edit_pen_text import load_pen, walk_layers, write_pen_copy
 from pen_design import absolute_path, layer_index, number, select
@@ -32,6 +33,7 @@ PREVIEW_PIXEL_LIMIT = 4_000_000
 PREVIEW_BYTE_LIMIT = 3_000_000
 CANVAS_PIXEL_LIMIT = EXPORT_PIXEL_LIMIT
 CANVAS_BYTE_LIMIT = 20_000_000
+SVG_NAMESPACE = "{http://www.w3.org/2000/svg}"
 MAX_PNG_EDGE = 8192
 PREVIEW_CACHE_SIZE = 8
 PREVIEW_CACHE_AGE = 300
@@ -251,26 +253,44 @@ def renderable_frame(index, layer_id, scale, pixel_limit):
     return layer
 
 
+def render_canvas_svg(file_path, request=None):
+    check_cancelled(request)
+    source = absolute_path(file_path).resolve()
+    document = load_pen(source)
+    metadata, data = render_staged_image(source, document, None, 1, CANVAS_PIXEL_LIMIT, CANVAS_BYTE_LIMIT,
+                                         45, request, prefer_local=True, image_format="svg")
+    return {**metadata, "artboards": artboard_titles(document["children"], 1)}, data
+
+
 def render_staged_png(source, staged_document, layer, scale, pixel_limit, byte_limit, timeout, request,
                       *, prefer_local=False):
+    return render_staged_image(source, staged_document, layer, scale, pixel_limit, byte_limit, timeout, request,
+                               prefer_local=prefer_local)
+
+
+def render_staged_image(source, staged_document, layer, scale, pixel_limit, byte_limit, timeout, request,
+                        *, prefer_local=False, image_format="png"):
+    reader = read_rendered_svg if image_format == "svg" else read_rendered_png
     # Stage beside the source so relative assets and library imports still resolve.
     with NamedTemporaryFile(dir=source.parent, prefix=".local-pen-render-", delete=True) as marker:
         staged = Path(marker.name + ".pen")
         write_pen_copy(staged_document, staged)
         try:
             with TemporaryDirectory(prefix="local-pen-png-") as temporary:
-                output = Path(temporary) / "render.png"
+                output = Path(temporary) / f"render.{image_format}"
                 command = renderer_command() + [
                     "--in", str(staged), "--export", str(output),
-                    "--export-type", "png", "--export-scale", str(scale),
+                    "--export-type", image_format, "--export-scale", str(scale),
                 ]
                 images = set()
                 if prefer_local:
                     local, images = preview_dependencies(staged_document)
                     if local and all((source.parent / image).is_file() for image in images):
-                        result = render_local_preview(command, output, layer, scale, pixel_limit, byte_limit, request)
+                        result = render_local_preview(command, output, layer, scale, pixel_limit, byte_limit, request, reader)
                         if result is not None:
                             return result
+                if image_format == "svg":
+                    raise ValueError("an isolated SVG export is unavailable")
                 missing = output.with_suffix(".missing")
                 env = renderer_environment() if prefer_local else None
                 if env is not None:
@@ -291,7 +311,7 @@ def render_staged_png(source, staged_document, layer, scale, pixel_limit, byte_l
             staged.unlink()
 
 
-def render_local_preview(command, output, layer, scale, pixel_limit, byte_limit, request):
+def render_local_preview(command, output, layer, scale, pixel_limit, byte_limit, request, reader):
     if sys.platform != "darwin" or not os.access(MACOS_NETWORK_ISOLATION, os.X_OK):
         return None
     env = renderer_environment()
@@ -307,9 +327,9 @@ def render_local_preview(command, output, layer, scale, pixel_limit, byte_limit,
         check_cancelled(request)
         if not code:
             if not missing.exists():
-                return read_rendered_png(output, layer, scale, pixel_limit, byte_limit)
+                return reader(output, layer, scale, pixel_limit, byte_limit)
             if layer is None and set(missing.read_text().splitlines()) == {"font"}:
-                metadata, data = read_rendered_png(output, layer, scale, pixel_limit, byte_limit)
+                metadata, data = reader(output, layer, scale, pixel_limit, byte_limit)
                 return {**metadata, "font_fallback": True}, data
     except CanvasTooLarge:
         raise
@@ -337,6 +357,29 @@ def read_rendered_png(output, layer, scale, pixel_limit, byte_limit):
     if not (0 < width <= MAX_PNG_EDGE and 0 < height <= MAX_PNG_EDGE and width * height <= pixel_limit):
         raise ValueError("PNG dimensions are invalid or exceed the size limit")
     return {"layer_id": layer["id"] if layer else None, "width": width, "height": height, "scale": scale}, data
+
+
+def read_rendered_svg(output, _layer, scale, _pixel_limit, byte_limit):
+    if output.stat().st_size > byte_limit:
+        raise ValueError("SVG exceeds the preview size limit")
+    data = output.read_bytes()
+    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+        raise ValueError("SVG contains an unsupported document declaration")
+    try:
+        root = ElementTree.fromstring(data)
+        x, y, width, height = map(float, root.attrib["viewBox"].split())
+    except (ElementTree.ParseError, KeyError, ValueError) as error:
+        raise ValueError("Pen CLI produced an invalid SVG") from error
+    if root.tag != SVG_NAMESPACE + "svg" or (x, y) != (0, 0) or not all(0 < v <= 100_000 for v in (width, height)):
+        raise ValueError("SVG has unsupported bounds")
+    for node in root.iter():
+        if node.tag in {SVG_NAMESPACE + "script", SVG_NAMESPACE + "foreignObject"}:
+            raise ValueError("SVG contains an unsupported element")
+        for attr in ("href", "{http://www.w3.org/1999/xlink}href"):
+            uri = node.get(attr)
+            if uri and not uri.startswith(("#", "data:image/")):
+                raise ValueError("SVG contains an external reference")
+    return {"width": width, "height": height, "scale": scale}, data
 
 
 def render_frame_png(source, document, index, layer_id, scale, pixel_limit, byte_limit, timeout=45, request=None,

@@ -60,14 +60,14 @@ def load_task_design(directory):
     return task_file(directory, directory / data["file_path"])
 
 
-def task_design_for_path(file_path):
+def task_directory_for_path(file_path):
     if file_path is None:
         return None
     parent = absolute_path(file_path).parent.resolve()
     for directory in (parent, *parent.parents):
         config = directory / TASK_DESIGN_CONFIG
         if config.exists() or config.is_symlink():
-            return load_task_design(directory)
+            return directory
     return None
 
 
@@ -154,16 +154,16 @@ def file_revision(path):
     return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size
 
 
-def edit_and_reopen(handler, arguments, *, task_file_path=None):
+def edit_and_reopen(handler, arguments, *, task_file_path=None, revisions=None):
     if sys.platform != "darwin":
         raise ValueError("automatic reopening requires the macOS Pen desktop app")
     configured = str(task_file_path) if task_file_path is not None else os.environ.get("LOCAL_PEN_WORKING_COPY")
     if not configured:
         raise ValueError("select this task's design with task_design before updating it in place")
-    return save_selected_design(handler, arguments, absolute_path(configured), reopen=True)
+    return save_selected_design(handler, arguments, absolute_path(configured), reopen=True, revisions=revisions)
 
 
-def save_selected_design(handler, arguments, target, *, reopen=False):
+def save_selected_design(handler, arguments, target, *, reopen=False, revisions=None):
     source = absolute_path(arguments.get("file_path"))
     destination = absolute_path(arguments.get("output_path"))
     if target.is_symlink() or source.is_symlink() or destination.is_symlink():
@@ -180,6 +180,8 @@ def save_selected_design(handler, arguments, target, *, reopen=False):
         if target.is_symlink() or not target.is_file() or target.stat().st_nlink != 1:
             raise ValueError("the working copy must be an existing .pen file with a single link")
         before = file_revision(target)
+        if revisions is not None and revisions.get(target, before) != before:
+            raise ValueError("the task design changed since this session read it; inspect the latest layers and retry")
         with TemporaryDirectory(dir=target.parent, prefix=".local-pen-edit-") as directory:
             draft = Path(directory) / "draft.pen"
             result = handler(**{**arguments, "file_path": str(target), "output_path": str(draft)})
@@ -190,11 +192,13 @@ def save_selected_design(handler, arguments, target, *, reopen=False):
 
             if reopen:
                 desktop_document("close", target)
-            display = {"display": "live_preview"}
+            display = {"display": "saved"}
             try:
                 if file_revision(target) != before:
                     raise ValueError("the working copy changed during the edit; reload it and retry")
                 os.replace(ready, target)
+                if revisions is not None:
+                    revisions[target] = file_revision(target)
             finally:
                 if reopen:
                     try:
@@ -204,6 +208,6 @@ def save_selected_design(handler, arguments, target, *, reopen=False):
                         display = {"reopen": {"ok": False, "message": str(error)}}
         return {**result, "output_path": str(target), **display}
     except BlockingIOError:
-        raise ValueError("another working copy update is in progress; retry after it finishes") from None
+        raise ValueError("another working copy update is in progress; inspect the latest layers before retrying") from None
     finally:
         os.close(directory_fd)

@@ -70,6 +70,19 @@ class LocalPenMcpTest(unittest.TestCase):
         self.source.write_text(self.original_text, encoding="utf-8")
         self.env = os.environ.copy()
         self.env["XDG_STATE_HOME"] = str(self.source.parent / "state")
+        self.addCleanup(self.stop_test_previews)
+
+    def stop_test_previews(self):
+        from pen_live_preview import SharedPreview, read_preview_address
+
+        folder = Path(self.env["XDG_STATE_HOME"]) / "local_pen" / "previews"
+        for record in folder.glob("*.json"):
+            address = read_preview_address(record)
+            if address is not None:
+                peer = SharedPreview(self.source.resolve(), *address)
+                owner = peer.details()
+                if owner is not None:
+                    peer.close(source_key=owner["source"])
 
     def rpc(self, *calls, after_reply=None, cwd=None):
         requests = [
@@ -153,15 +166,24 @@ class LocalPenMcpTest(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "live preview requires POSIX")
     def test_live_preview_keeps_the_task_url_between_mcp_processes(self):
+        from urllib.request import urlopen
+
         directory = self.source.parent
         start = ("tools/call", {"name": "live_preview"})
         bind = ("tools/call", {"name": "task_design", "arguments": {
             "task_dir": str(directory), "file_path": str(self.source),
         }})
         _, previous = self.rpc(bind, start, cwd=directory)
-        current, = self.rpc(start, cwd=directory)
+        url = previous["structuredContent"]["url"]
+        with urlopen(url, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+        status = ("tools/call", {"name": "live_preview", "arguments": {"action": "status"}})
+        current, updated = self.rpc(status, self.call("update_text", layer_id="heading", text="接手续改"),
+                                    cwd=directory)
         self.assertFalse(current.get("isError"), current)
-        self.assertEqual(current["structuredContent"]["url"], previous["structuredContent"]["url"])
+        self.assertEqual(current["structuredContent"]["url"], url)
+        self.assertEqual(updated["structuredContent"]["preview_url"], url)
+        self.assertIn("接手续改", self.source.read_text())
 
         other_task = directory / "other-task"
         other_task.mkdir()
@@ -173,30 +195,195 @@ class LocalPenMcpTest(unittest.TestCase):
         self.assertNotEqual(other["structuredContent"]["url"], current["structuredContent"]["url"])
 
     @unittest.skipUnless(os.name == "posix", "live preview requires POSIX")
+    def test_default_edit_starts_preview_and_second_process_shares_it(self):
+        from urllib.request import urlopen
+
+        directory = self.source.parent
+        bind = self.call("task_design", task_dir=str(directory))
+        first_edit = self.call("update_text", layer_id="heading", text="第一个会话")
+        second_edit = self.call("update_text", layer_id="other", text="第二个会话")
+        start = ("tools/call", {"name": "live_preview"})
+        status = ("tools/call", {"name": "live_preview", "arguments": {"action": "status"}})
+        other = []
+
+        def concurrent(request_id):
+            if request_id == 2:
+                other.extend(self.rpc(start, second_edit, cwd=directory))
+            elif request_id == 3 and not other[0].get("isError"):
+                with urlopen(other[0]["structuredContent"]["url"], timeout=2) as response:
+                    self.assertEqual(response.status, 200)
+
+        _, saved, active = self.rpc(bind, first_edit, status, cwd=directory, after_reply=concurrent)
+        for result in [saved, active, *other]:
+            self.assertFalse(result.get("isError"), result)
+        self.assertEqual(saved["structuredContent"]["preview_url"], active["structuredContent"]["url"])
+        self.assertEqual(other[0]["structuredContent"]["url"], active["structuredContent"]["url"])
+        self.assertEqual(other[1]["structuredContent"]["preview_url"], active["structuredContent"]["url"])
+        children = json.loads(self.source.read_text())["children"][0]["children"]
+        self.assertEqual([node["content"] for node in children], ["第一个会话", "第二个会话"])
+
+    @unittest.skipUnless(os.name == "posix", "live preview requires POSIX")
+    def test_stale_session_must_read_again_before_saving(self):
+        directory = self.source.parent
+        bind = self.call("task_design", task_dir=str(directory))
+        inspect = self.call("inspect_layers", layer_id="frame")
+        edit = self.call("update_text", layer_id="heading", text="本会话的修改")
+        other_edit = self.call("update_text", layer_id="other", text="另一个会话的修改")
+
+        def concurrent(request_id):
+            if request_id == 2:
+                result, = self.rpc(other_edit, cwd=directory)
+                self.assertFalse(result.get("isError"), result)
+
+        _, _, rejected, _, saved = self.rpc(bind, inspect, edit, inspect, edit,
+                                           cwd=directory, after_reply=concurrent)
+        self.assertTrue(rejected.get("isError"), rejected)
+        self.assertIn("changed since this session read it", rejected["content"][0]["text"])
+        self.assertFalse(saved.get("isError"), saved)
+        children = json.loads(self.source.read_text())["children"][0]["children"]
+        self.assertEqual([node["content"] for node in children], ["本会话的修改", "另一个会话的修改"])
+
+    @unittest.skipUnless(os.name == "posix", "live preview requires POSIX")
+    def test_other_session_cannot_redirect_an_implicit_edit_by_rebinding_the_task(self):
+        directory = self.source.parent
+        self.copy.write_text(self.original_text, encoding="utf-8")
+        bind = self.call("task_design", task_dir=str(directory))
+        edit = ("tools/call", {"name": "update_text", "arguments": {"layer_id": "heading", "text": "错误任务稿"}})
+
+        def rebind(request_id):
+            if request_id == 1:
+                result, = self.rpc(self.call("task_design", task_dir=str(directory), file_path=str(self.copy)))
+                self.assertFalse(result.get("isError"), result)
+
+        _, rejected = self.rpc(bind, edit, cwd=directory, after_reply=rebind)
+        self.assertTrue(rejected.get("isError"), rejected)
+        self.assertIn("selected task design changed", rejected["content"][0]["text"])
+        self.assertEqual(self.source.read_text(encoding="utf-8"), self.original_text)
+        self.assertEqual(self.copy.read_text(encoding="utf-8"), self.original_text)
+
+    @unittest.skipUnless(os.name == "posix", "live preview requires POSIX")
+    def test_preview_control_targets_the_requested_task_across_sessions(self):
+        from pen_live_preview import LivePreview
+        from pen_working_copy import task_design
+
+        first = self.source.parent
+        other = first / "other-task"
+        other.mkdir()
+        other_design = other / "source.pen"
+        other_design.write_text(self.original_text, encoding="utf-8")
+        task_design(str(first), str(self.source))
+        task_design(str(other), str(other_design))
+        with (patch.dict(os.environ, {"XDG_STATE_HOME": self.env["XDG_STATE_HOME"]}),
+              LivePreview() as a, LivePreview() as b):
+            first_url = a.command(task_dir=str(first))["url"]
+            other_url = b.command(task_dir=str(other))["url"]
+            self.assertEqual(a.command(action="status", task_dir=str(other))["url"], other_url)
+            self.assertFalse(a.command(action="stop", task_dir=str(other))["active"])
+            self.assertFalse(b.command(action="status")["active"])
+            self.assertEqual(a.command(action="status")["url"], first_url)
+
+    @unittest.skipUnless(os.name == "posix", "live preview requires POSIX")
+    def test_fresh_session_can_stop_a_preview_after_its_binding_was_removed(self):
+        from urllib.error import URLError
+        from urllib.request import urlopen
+        from pen_working_copy import TASK_DESIGN_CONFIG
+
+        directory = self.source.parent
+        start = ("tools/call", {"name": "live_preview"})
+        _, preview = self.rpc(self.call("task_design", task_dir=str(directory)), start, cwd=directory)
+        url = preview["structuredContent"]["url"]
+        with urlopen(url, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+        (directory / TASK_DESIGN_CONFIG).unlink()
+        stop = ("tools/call", {"name": "live_preview", "arguments": {"action": "stop"}})
+        stopped, = self.rpc(stop, cwd=directory)
+        self.assertFalse(stopped["structuredContent"]["active"])
+        with self.assertRaises(URLError):
+            urlopen(url, timeout=2)
+
+    @unittest.skipUnless(os.name == "posix", "live preview requires POSIX")
+    def test_starts_current_worker_on_the_older_owners_address(self):
+        from pen_live_preview import PREVIEW_VERSION, PreviewWindow, SharedPreview, preview_address_file
+        from pen_working_copy import task_design
+
+        directory = self.source.parent.resolve()
+        task_design(str(directory), str(self.source))
+        previous = PreviewWindow(self.source.resolve(), 1)
+        self.addCleanup(previous.close)
+        with patch.dict(os.environ, {"XDG_STATE_HOME": self.env["XDG_STATE_HOME"]}):
+            record = preview_address_file(directory)
+            record.parent.mkdir(mode=0o700, parents=True)
+            record.write_text(json.dumps({"port": previous.server.server_port, "token": previous.route_token}))
+        start = ("tools/call", {"name": "live_preview"})
+        preview, = self.rpc(start, cwd=directory)
+        peer = SharedPreview(self.source.resolve(), previous.server.server_port, previous.route_token)
+        self.assertFalse(preview.get("isError"), preview)
+        self.assertEqual(preview["structuredContent"]["url"], peer.status()["url"])
+        self.assertEqual(peer.details()["worker_version"], PREVIEW_VERSION)
+        self.assertTrue(previous.cancelled.is_set())
+
+    @unittest.skipUnless(os.name == "posix", "live preview requires POSIX")
+    def test_foreign_listener_does_not_block_default_save(self):
+        from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+        from hashlib import sha256
+        from secrets import token_urlsafe
+        from threading import Thread
+        from urllib.parse import urlsplit
+
+        class OtherService(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+
+        directory = self.source.parent.resolve()
+        folder = Path(self.env["XDG_STATE_HOME"]) / "local_pen" / "previews"
+        folder.mkdir(mode=0o700, parents=True)
+        record = folder / (sha256(os.fsencode(directory)).hexdigest() + ".json")
+        with ThreadingHTTPServer(("127.0.0.1", 0), OtherService) as foreign:
+            thread = Thread(target=foreign.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
+            thread.start()
+            try:
+                record.write_text(json.dumps({"port": foreign.server_port, "token": token_urlsafe(24)}))
+                _, saved = self.rpc(self.call("task_design", task_dir=str(directory)),
+                                    self.call("update_text", layer_id="heading", text="端口占用测试"), cwd=directory)
+                self.assertFalse(saved.get("isError"), saved)
+                preview_url = saved["structuredContent"]["preview_url"]
+                self.assertNotEqual(urlsplit(preview_url).port, foreign.server_port)
+                self.assertIn("端口占用测试", self.source.read_text())
+            finally:
+                foreign.shutdown()
+                thread.join()
+
+    @unittest.skipUnless(os.name == "posix", "live preview requires POSIX")
     def test_live_preview_reconnect_returns_the_new_canvas_at_the_saved_url(self):
         from urllib.request import Request, urlopen
-        from pen_live_preview import LivePreview
+        from pen_live_preview import PreviewWindow
 
-        directory = str(self.source.parent)
-        call_tool({"name": "task_design", "arguments": {"task_dir": directory, "file_path": str(self.source)}})
         rendered = [({"artboards": [{"name": "旧画板"}]}, b"old"),
                     ({"artboards": [{"name": "新画板"}]}, b"new")]
-        with (patch.dict(os.environ, {"XDG_STATE_HOME": self.env["XDG_STATE_HOME"]}),
-              patch("pen_live_preview.render_canvas_png", side_effect=rendered)):
-            with LivePreview() as live:
-                url = live.command(task_dir=directory)["url"]
+        with patch("pen_live_preview.render_canvas_png", side_effect=rendered):
+            first = PreviewWindow(self.source.resolve(), 1)
+            self.addCleanup(first.close)
+            url = first.status()["url"]
+            try:
                 with urlopen(url + "canvas.png", timeout=2) as response:
                     self.assertEqual(response.read(), b"old")
                     previous = response.headers["ETag"]
-            with LivePreview() as live:
-                self.assertEqual(live.command(task_dir=directory)["url"], url)
-                request = Request(url + "canvas.png", headers={"If-None-Match": previous})
-                with urlopen(request, timeout=2) as response:
-                    self.assertEqual(response.read(), b"new")
-                    current = response.headers["ETag"]
-                    self.assertNotEqual(current, previous)
-                with urlopen(Request(url + "artboards.json", headers={"If-Match": current}), timeout=2) as response:
-                    self.assertEqual(json.load(response), [{"name": "新画板"}])
+            finally:
+                first.close()
+            second = PreviewWindow(self.source.resolve(), 1, first.server.server_port, first.route_token)
+            self.addCleanup(second.close)
+            self.assertEqual(second.status()["url"], url)
+            request = Request(url + "canvas.png", headers={"If-None-Match": previous})
+            with urlopen(request, timeout=2) as response:
+                self.assertEqual(response.read(), b"new")
+                current = response.headers["ETag"]
+                self.assertNotEqual(current, previous)
+            with urlopen(Request(url + "artboards.json", headers={"If-Match": current}), timeout=2) as response:
+                self.assertEqual(json.load(response), [{"name": "新画板"}])
 
     @unittest.skipUnless(os.name == "posix", "live preview requires POSIX")
     def test_live_preview_preserves_the_url_when_the_task_selects_another_file(self):
@@ -319,6 +506,72 @@ class LocalPenMcpTest(unittest.TestCase):
                 self.assertNotEqual(second.headers["ETag"], tag)
             self.assertEqual(renderer.call_count, 2)
 
+    def test_live_preview_serves_vector_and_keeps_the_png_route(self):
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+        from pen_live_preview import PreviewWindow
+
+        with (patch("pen_live_preview.render_canvas_svg", return_value=({"artboards": []}, b"vector")) as svg,
+              patch("pen_live_preview.render_canvas_png", return_value=({"artboards": []}, b"raster")) as png):
+            window = PreviewWindow(self.source.resolve(), 1)
+            self.addCleanup(window.close)
+            url = window.status()["url"]
+            with urlopen(url + "canvas", timeout=2) as response:
+                self.assertEqual(response.headers["X-Local-Pen-Image"], "svg")
+                self.assertEqual(response.headers.get_content_type(), "application/octet-stream")
+                self.assertEqual(response.read(), b"vector")
+                vector_tag = response.headers["ETag"]
+            with urlopen(url + "canvas.png", timeout=2) as response:
+                self.assertEqual(response.headers.get_content_type(), "image/png")
+                self.assertEqual(response.read(), b"raster")
+                self.assertNotEqual(vector_tag, response.headers["ETag"])
+            with self.assertRaises(HTTPError) as unchanged:
+                urlopen(Request(url + "canvas", headers={"If-None-Match": vector_tag}), timeout=2)
+            self.assertEqual(unchanged.exception.code, 304)
+            with urlopen(Request(url + "artboards.json", headers={"If-Match": vector_tag}), timeout=2) as response:
+                self.assertEqual(json.load(response), [])
+        self.assertEqual(svg.call_count, 1)
+        self.assertEqual(png.call_count, 1)
+
+    def test_live_preview_retains_png_when_vector_export_is_unavailable(self):
+        from urllib.request import urlopen
+        from pen_live_preview import PreviewWindow
+
+        with (patch("pen_live_preview.render_canvas_svg", side_effect=ValueError("unsupported drawing")),
+              patch("pen_live_preview.render_canvas_png", return_value=({}, b"raster")) as png):
+            window = PreviewWindow(self.source.resolve(), 1)
+            self.addCleanup(window.close)
+            url = window.status()["url"]
+            with urlopen(url + "canvas", timeout=2) as response:
+                self.assertEqual(response.headers.get_content_type(), "image/png")
+                self.assertEqual(response.read(), b"raster")
+            self.assertEqual(png.call_count, 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "vector export uses macOS render isolation")
+    def test_canvas_svg_preserves_paths_and_rejects_external_references(self):
+        from pen_render import render_canvas_svg
+
+        for contents in ('<path d="M 0 0 L 10 10"/>', '<image href="https://example.com/image.png"/>'):
+            with self.subTest(contents=contents):
+                svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 60">{contents}</svg>').encode()
+
+                def run(command, *_args, **_kwargs):
+                    self.assertEqual(command[0], "/usr/bin/sandbox-exec")
+                    self.assertEqual(command[command.index("--export-type") + 1], "svg")
+                    Path(command[command.index("--export") + 1]).write_bytes(svg)
+                    return 0
+
+                with (patch("pen_render.renderer_command", return_value=["pen"]),
+                      patch("pen_render.run_renderer", side_effect=run) as renderer):
+                    if contents.startswith("<path"):
+                        metadata, png = render_canvas_svg(str(self.source))
+                        self.assertEqual((metadata["width"], metadata["height"]), (80, 60))
+                        self.assertEqual(png, svg)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "isolated SVG export"):
+                            render_canvas_svg(str(self.source))
+                    self.assertEqual(renderer.call_count, 1)
+
     def test_live_preview_discards_a_render_superseded_during_saving(self):
         from urllib.request import urlopen
 
@@ -417,7 +670,7 @@ class LocalPenMcpTest(unittest.TestCase):
         self.assertTrue(missing["isError"])
         self.assertEqual(self.source.read_text(), self.original_text)
 
-    @unittest.skipUnless(sys.platform == "darwin", "Pen desktop refresh uses macOS")
+    @unittest.skipUnless(os.name == "posix", "in-place saves use POSIX locks")
     def test_task_edit_treats_null_output_as_in_place(self):
         task = self.source.parent
         self.rpc(self.call("task_design", task_dir=str(task)))
@@ -426,10 +679,9 @@ class LocalPenMcpTest(unittest.TestCase):
         ]}
         with patch.object(pen_working_copy, "desktop_document") as helper:
             result = call_tool({"name": "edit_design", "arguments": arguments})
-            self.assertTrue(result.get("structuredContent", {}).get("reopen", {}).get("ok"), result)
-            conflict = call_tool({"name": "edit_design", "arguments": {**arguments, "reopen": False}})
-            self.assertIn("omit reopen", conflict["content"][0]["text"])
-        self.assertEqual(helper.call_count, 2)
+            self.assertEqual(result.get("structuredContent", {}).get("display"), "saved", result)
+        helper.assert_not_called()
+        self.assertIn("已修改", self.source.read_text(encoding="utf-8"))
         self.assertFalse(self.copy.exists())
 
     def test_temporary_design_can_be_inspected_and_previewed_then_is_removed(self):
@@ -494,11 +746,16 @@ class LocalPenMcpTest(unittest.TestCase):
         selected, = self.rpc(self.call("edit_design", **arguments, separate_output=True))
         self.assertEqual(selected["structuredContent"]["output_path"], str(self.copy))
         self.assertEqual(self.source.read_text(), self.original_text)
+        rejected, = self.rpc(self.call("edit_design", **{**arguments, "output_path": str(self.source)},
+                                       separate_output=True))
+        self.assertTrue(rejected.get("isError"), rejected)
+        self.assertIn("separate_output requires a new output_path", rejected["content"][0]["text"])
+        self.assertEqual(self.source.read_text(), self.original_text)
 
     @unittest.skipUnless(sys.platform == "darwin", "Pen desktop refresh uses macOS")
-    def test_explicit_current_task_path_reopens_without_a_reopen_flag(self):
+    def test_explicit_current_task_path_reopens_with_a_reopen_flag(self):
         self.rpc(self.call("task_design", task_dir=str(self.source.parent)))
-        _, params = self.edit(output_path=str(self.source))
+        _, params = self.edit(output_path=str(self.source), reopen=True)
         with patch.object(pen_working_copy, "desktop_document") as helper:
             result = call_tool(params)
         self.assertTrue(result.get("structuredContent", {}).get("reopen", {}).get("ok"), result)
@@ -507,12 +764,12 @@ class LocalPenMcpTest(unittest.TestCase):
         self.assertFalse(self.copy.exists())
 
     @unittest.skipUnless(sys.platform == "darwin", "Pen desktop refresh uses macOS")
-    def test_task_edit_uses_bound_file_and_reopens_by_default(self):
+    def test_desktop_edit_reopens_the_bound_file_when_requested(self):
         task = self.source.parent
         self.copy.write_text(self.original_text, encoding="utf-8")
         self.rpc(self.call("task_design", task_dir=str(task), file_path=str(self.copy)))
         operations = [{"op": "update", "id": "heading", "properties": {"fontSize": 18}}]
-        arguments = {"task_dir": str(task), "operations": operations}
+        arguments = {"task_dir": str(task), "operations": operations, "reopen": True}
         params = {"name": "edit_design", "arguments": arguments}
         with patch.dict(os.environ, LOCAL_PEN_WORKING_COPY=str(self.source)):
             with patch.object(pen_working_copy, "desktop_document") as helper:

@@ -9,11 +9,11 @@ from threading import Event, Lock
 
 from edit_pen_text import load_pen, walk_layers, write_pen_copy
 from pen_design import MAX_LAYER_PAGE, absolute_path, edit_design, inspect_layers, layer_page_end
-from pen_live_preview import LivePreview
+from pen_live_preview import PREVIEW_VERSION, LivePreview
 from pen_render import MAX_BATCH_FRAMES, export_png, export_png_batch, preview_png
 from pen_working_copy import (
-    edit_and_reopen, edit_temporary_design, load_task_design, save_selected_design, task_design,
-    task_design_for_path, task_directory,
+    edit_and_reopen, edit_temporary_design, file_revision, load_task_design, save_selected_design,
+    task_design, task_directory, task_directory_for_path,
 )
 
 
@@ -21,7 +21,7 @@ FILE_PATH = {"type": "string", "description": "Absolute path to a saved local .p
 TASK_DIR = {"type": "string", "description": "Absolute task directory. Defaults to the MCP server's working directory."}
 REOPEN = {
     "type": "boolean",
-    "description": "Omit for routine edits. Reopens Pen by default unless a live preview is active.",
+    "description": "Set true only when the user explicitly asks to reopen the document in Pen. Defaults to false.",
 }
 EDIT_OUTPUT_PATH = {
     "type": ["string", "null"],
@@ -48,7 +48,8 @@ TOOLS = [
         "name": "live_preview",
         "description": (
             "Start, show status, or stop the local browser live preview for the selected task design. "
-            "Start only when requested and give the user the fixed per-task URL to open themselves. "
+            "In-place edits start or reuse this preview automatically. Use the fixed URL returned for the task. "
+            "The preview keeps running when an AI session exits, while the tab is active. "
             "While active, the existing tab refreshes after each save. Do not open or refresh it with browser tools "
             "unless the user explicitly requests browser interaction. "
             "The preview shows the entire canvas, including all visible artboards in their original layout."
@@ -58,7 +59,7 @@ TOOLS = [
             "properties": {
                 "action": {"enum": ["start", "status", "stop"], "default": "start"},
                 "task_dir": TASK_DIR,
-                "scale": RENDER_PROPERTIES["scale"],
+                "scale": {**RENDER_PROPERTIES["scale"], "description": "Scale for the PNG fallback."},
             },
             "additionalProperties": False,
         },
@@ -294,7 +295,7 @@ def update_text(file_path, layer_id, text, output_path):
 RENDER_TOOLS = {"preview_png": preview_png, "export_png": export_png, "export_png_batch": export_png_batch}
 
 
-def call_tool(params, request=None, *, live=None):
+def call_tool(params, request=None, *, live=None, revisions=None, selection=None):
     try:
         handler = {
             "find_layers": find_layers, "update_text": update_text,
@@ -323,47 +324,65 @@ def call_tool(params, request=None, *, live=None):
                 arguments.pop("output_path", None)
             has_output = "output_path" in arguments
             target = None
+            directory = None
             if (editing and not temporary) or "file_path" not in arguments:
-                target = load_task_design(task_directory(task_dir))
+                directory = task_directory(task_dir)
+                target = load_task_design(directory)
             if editing and not temporary and target is None:
-                target = task_design_for_path(arguments.get("file_path")) or task_design_for_path(arguments.get("output_path"))
+                directory = (task_directory_for_path(arguments.get("file_path"))
+                             or task_directory_for_path(arguments.get("output_path")))
+                if directory is not None:
+                    target = load_task_design(directory)
+            if (editing and not temporary and selection is not None and arguments.get("file_path") is None
+                    and str(directory) == selection[0] and str(target) != selection[1]):
+                raise ValueError("the selected task design changed; use task_design to confirm it before editing")
             same_output = editing and not temporary and target is not None and has_output and (
                 absolute_path(arguments["output_path"]).resolve() == target
             )
             in_place = editing and not temporary and (not has_output or same_output)
-            background = in_place and live is not None and live.window is not None
-            reopen = arguments.pop("reopen", in_place and not background) if editing else False
+            reopen = arguments.pop("reopen", False) if editing else False
             if type(reopen) is not bool:
                 raise ValueError("reopen must be a boolean")
-            if background and (target != live.window.source or reopen):
-                raise ValueError("live preview is active: edit the previewed task without reopening Pen, "
-                                 "start a preview for the selected task, or stop live preview first")
-            if editing and not temporary and not (reopen or background) and not has_output:
-                raise ValueError("omit reopen and output_path to edit the selected Pen design in place")
+            if reopen and live is not None and live.window is not None and live.window.source == target:
+                if live.window.status()["active"]:
+                    raise ValueError("stop the task's live preview before reopening the document in Pen")
             if temporary and (reopen or has_output):
                 raise ValueError("temporary drafts cannot specify output_path or request reopen")
-            if separate and (reopen or temporary or not has_output):
+            if separate and (reopen or temporary or not has_output or same_output):
                 raise ValueError("separate_output requires a new output_path and no reopen or temporary flag")
-            if editing and target is not None and has_output and not (reopen or background or separate):
+            if editing and target is not None and has_output and not (reopen or in_place or separate):
                 raise ValueError("edit the selected Pen design in place by omitting output_path; use separate_output only if the user asked for a new file")
-            if (reopen or background) and arguments.get("file_path") is None:
+            if (reopen or in_place) and arguments.get("file_path") is None:
                 arguments.pop("file_path", None)
             # A provided destination with no source still creates a blank document.
-            needs_source = "file_path" not in arguments and (reopen or background or temporary or handler is not edit_design)
+            needs_source = "file_path" not in arguments and (reopen or in_place or temporary or handler is not edit_design)
             if needs_source and target is not None:
                 arguments["file_path"] = str(target)
-            if (reopen or background) and target is not None:
+            if (reopen or in_place) and target is not None:
                 arguments.setdefault("output_path", str(target))
-            if target is None and (needs_source or (reopen and not has_output)):
+            if target is None and (in_place and not reopen or needs_source or (reopen and not has_output)):
                 raise ValueError("select this task's design with task_design or provide explicit file paths")
-            if background:
-                output = save_selected_design(handler, arguments, target)
-            elif reopen:
-                output = edit_and_reopen(handler, arguments, task_file_path=target)
+            if reopen:
+                output = edit_and_reopen(handler, arguments, task_file_path=target, revisions=revisions)
+            elif in_place:
+                output = save_selected_design(handler, arguments, target, revisions=revisions)
+                if live is not None:
+                    try:
+                        preview = live.ensure(directory, target)
+                    except (OSError, ValueError, RecursionError) as error:
+                        output["preview_error"] = str(error)
+                    else:
+                        output.update(display="live_preview", preview_url=preview["url"])
             elif temporary:
                 output = edit_temporary_design(handler, arguments)
             else:
+                observed_path = None
+                if revisions is not None and handler in (find_layers, inspect_layers):
+                    observed_path = absolute_path(arguments.get("file_path")).resolve()
+                    revision = file_revision(observed_path)
                 output = handler(**arguments, request=request) if request is not None else handler(**arguments)
+                if observed_path is not None:
+                    revisions[observed_path] = revision
     except (OSError, TypeError, ValueError, RecursionError) as error:
         return {"isError": True, "content": [{"type": "text", "text": str(error)}]}
     image = None
@@ -379,7 +398,7 @@ def error(code, message):
     return {"error": {"code": code, "message": message}}
 
 
-def dispatch(request, *, live=None):
+def dispatch(request, *, live=None, revisions=None, selection=None):
     if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str):
         return error(-32600, "Invalid request")
     if "id" not in request:
@@ -395,17 +414,18 @@ def dispatch(request, *, live=None):
         return {"result": {
             "protocolVersion": version if version in supported else supported[-1],
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "local_pen", "version": "1.17.1"},
+            "serverInfo": {"name": "local_pen", "version": PREVIEW_VERSION},
             "instructions": (
                 "For Pen design work, use task_design to get the designated document. Only select a new "
                 "document when the user designates it. The last task confirmed with task_design is used "
                 "for subsequent path-free calls in that session. For routine requests to draw, update, or show a design, make editable "
                 "changes in the selected Pen document by omitting file_path and output_path. Draw comparison "
-                "frames and interaction states on that same canvas. When the user requests live preview, call live_preview "
-                "and give the user its URL to open themselves. For routine edits during live preview, omit reopen and let the existing tab "
-                "refresh automatically. Do not open, reload, or capture that tab with browser tools unless the user requests browser interaction. "
-                "Use preview_png when you need to visually check the design. Report background saving only when display is live_preview. "
-                "Otherwise verify reopen.ok. Never force a window or desktop switch as a workaround. "
+                "frames and interaction states on that same canvas. In-place edits start or reuse the task preview automatically. "
+                "Give the user preview_url when it is new, and let an existing tab refresh automatically. "
+                "Omit reopen unless the user asks to reopen Pen. Do not open, reload, or capture the preview tab with browser tools "
+                "unless the user requests browser interaction. Use preview_png for visual checks. "
+                "If an edit reports preview_error, it was already saved; start live_preview independently and do not repeat the edit. "
+                "If the design changed since your read, inspect the latest layers before retrying. "
                 "Use temporary=true for internal trials or explicitly preview-only requests. A PNG preview is for checking "
                 "the design, not a substitute for applying it to the canvas. Only save separate files or export images "
                 "when the user asks for them. If in-place editing or reopening fails, resolve the reported issue or tell "
@@ -417,7 +437,7 @@ def dispatch(request, *, live=None):
     if method == "tools/list":
         return {"result": {"tools": TOOLS}}
     if method == "tools/call":
-        return {"result": call_tool(params, live=live)}
+        return {"result": call_tool(params, live=live, revisions=revisions, selection=selection)}
     return error(-32601, "Method not found")
 
 
@@ -456,6 +476,8 @@ def main():
     active_lock = Lock()
     active = {}
     session_task_dir = None
+    session_selection = None
+    revisions = {}
 
     def send(message):
         with output_lock:
@@ -513,15 +535,21 @@ def main():
                         executor.submit(render, request_id, params, state)
                         continue
 
-            response = dispatch(request, live=live)
+            response = dispatch(request, live=live, revisions=revisions, selection=session_selection)
             if response is not None:
                 params = request.get("params", {}) if isinstance(request, dict) else {}
                 if isinstance(params, dict) and request.get("method") == "tools/call":
                     selection = response.get("result", {}).get("structuredContent")
                     if selection is not None and params.get("name") == "task_design":
                         session_task_dir = selection["task_dir"]
+                        session_selection = ((session_task_dir, selection["file_path"])
+                                             if selection["file_path"] is not None else None)
                     if selection and params.get("name") == "live_preview" and "task_dir" in selection:
                         session_task_dir = selection["task_dir"]
+                        session_selection = (session_task_dir, selection["file_path"])
+                    if selection and selection.get("display") == "live_preview":
+                        session_task_dir = str(live.directory)
+                        session_selection = (session_task_dir, selection["output_path"])
                 request_id = request.get("id") if isinstance(request, dict) else None
                 send({"id": request_id, **response})
 
