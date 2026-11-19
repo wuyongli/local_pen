@@ -18,16 +18,18 @@ from secrets import token_urlsafe
 from tempfile import NamedTemporaryFile
 from threading import Event, Lock, Thread
 from time import monotonic, time_ns
+from urllib.parse import parse_qs, urlsplit
 
 from edit_pen_text import load_pen
 from pen_render import canvas_scale, render_canvas_png, render_canvas_svg, validate_render_scale
 from pen_working_copy import file_revision, load_task_design, task_directory
+from pen_tiles import MIN_LEVEL, MAX_LEVEL, InvalidTile, NativeUnsupported, RendererBusy, StaleRevision, TilesPending, ViewportRenderer
 
 
 PREVIEW_CONTROL = "/_local_pen_preview"
 SIGNATURE_HEADER = "X-Local-Pen-Signature"
 PREVIEW_IDLE_SECONDS = 600
-PREVIEW_VERSION = "1.20.0"
+PREVIEW_VERSION = "1.21.0"
 
 
 def control_signature(token, message):
@@ -48,6 +50,9 @@ PAGE = """<!doctype html>
              min-width: 100%; min-height: 100%; width: max-content; height: max-content; }
   #surface[data-pannable] { padding: max(50vh, 36px) max(50vw, 16px); }
   #scene { position: relative; }
+  #tiles { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+  .tile { position: absolute; overflow: hidden; }
+  .tile img { position: absolute; max-width: none; box-shadow: none; }
   #artboard-titles { position: absolute; inset: 0; pointer-events: none; }
   .artboard-title { position: absolute; box-sizing: border-box; transform: translateY(calc(-100% - 4px));
                     padding: 0 3px; border-radius: 3px; background: #1e1e1e; color: #d7dcda;
@@ -65,7 +70,7 @@ PAGE = """<!doctype html>
            padding: 7px 12px; background: #242726; border: 1px solid #565c59; border-radius: 6px; }
 </style>
 <main tabindex="0" aria-label="画板区域">
-  <div id="surface"><div id="scene"><img alt="实时画板" draggable="false" hidden><div id="artboard-titles"></div></div></div>
+  <div id="surface"><div id="scene"><img alt="实时画板" draggable="false" hidden><div id="tiles"></div><div id="artboard-titles"></div></div></div>
 </main>
 <nav aria-label="画板缩放">
   <button type="button" aria-label="缩小" id="zoom-out">−</button>
@@ -86,6 +91,7 @@ let fontFallback = false;
 let preferVector = true;
 let imageURL;
 let ratio = 1;
+let autoFit = true;
 let width = 0;
 let height = 0;
 let drag;
@@ -118,11 +124,15 @@ function layout(anchor = [0.5, 0.5], point) {
   const [x, y] = point ?? viewportCenter();
   viewport.scrollLeft += image.left + image.width * anchor[0] - x;
   viewport.scrollTop += image.top + image.height * anchor[1] - y;
+  window.dispatchEvent(new Event('local-pen-view-change'));
 }
 
 function zoom(next, point) {
+  autoFit = false;
   const anchor = imageAnchor(point);
-  ratio = Math.max(0.25, Math.min(8, next));
+  const fitted = Math.min(1, Math.max(1, viewport.offsetWidth - 32) / width,
+                         Math.max(1, viewport.offsetHeight - 52) / height);
+  ratio = Math.max(0.25, Math.min(8 / fitted, next));
   layout(anchor, point);
 }
 
@@ -147,7 +157,7 @@ function showArtboardTitles(artboards) {
 
 document.querySelector('#zoom-in').addEventListener('click', () => zoom(ratio * 1.25));
 document.querySelector('#zoom-out').addEventListener('click', () => zoom(ratio / 1.25));
-document.querySelector('#fit').addEventListener('click', () => { ratio = 1; layout(); });
+document.querySelector('#fit').addEventListener('click', () => { autoFit = true; ratio = 1; layout(); });
 window.addEventListener('resize', () => layout(imageAnchor()));
 
 viewport.addEventListener('wheel', event => {
@@ -261,8 +271,8 @@ async function refresh() {
     setTimeout(refresh, 500);
   }
 }
-refresh();
 </script>
+<script src="preview.js"></script>
 </html>
 """.encode()
 
@@ -344,10 +354,14 @@ class PreviewHandler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
         path = self.path.partition("?")[0]
-        if path in (view.route, view.route + "canvas", view.route + "canvas.png", view.route + "artboards.json"):
+        if path in (view.route, view.route + "canvas", view.route + "canvas.png", view.route + "artboards.json", view.route + "manifest.json", view.route + "tile.png"):
             view.last_activity = monotonic()
         if path == view.route:
             self.reply(200, "text/html; charset=utf-8", PAGE)
+        elif path == view.route + "preview.js":
+            self.reply(200, "text/javascript; charset=utf-8", Path(__file__).with_name("pen_preview.js").read_bytes())
+        elif path in (view.route + "manifest.json", view.route + "tile.png"):
+            self.serve_tiles(path)
         elif path in (view.route + "canvas", view.route + "canvas.png"):
             try:
                 frame = view.image(prefer_vector=path.endswith("/canvas"))
@@ -373,6 +387,42 @@ class PreviewHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def serve_tiles(self, path):
+        view = self.server.view
+        try:
+            if path.endswith("manifest.json"):
+                manifest = view.tiles.manifest()
+                etag = manifest["etag"]
+                if self.headers.get("If-None-Match") == etag:
+                    self.reply(304, "application/json", b"", etag)
+                else:
+                    self.reply(200, "application/json", json.dumps(manifest, separators=(",", ":")).encode(), etag)
+            else:
+                try:
+                    query = parse_qs(urlsplit(self.path).query, strict_parsing=True, max_num_fields=3)
+                    if set(query) != {"level", "col", "row"} or any(len(v) != 1 for v in query.values()):
+                        raise ValueError("Invalid tile parameters")
+                    if any(re.fullmatch(r"-?[0-9]{1,9}", v[0]) is None for v in query.values()):
+                        raise ValueError("Invalid tile coordinates")
+                    level, col, row = (int(query[k][0]) for k in ("level", "col", "row"))
+                    if not MIN_LEVEL <= level <= MAX_LEVEL or min(col,row) < 0:
+                        raise ValueError("Invalid tile coordinates")
+                except ValueError:
+                    self.reply(400, "text/plain", b"Invalid tile request")
+                    return
+                metadata, data = view.tiles.tile(self.headers.get("If-Match"), level, col, row)
+                self.reply(200, "image/png", data, font_fallback=metadata.get("font_fallback", False), image_format="tile")
+        except NativeUnsupported:
+            self.reply(501, "text/plain", b"Native viewport adapter is unsupported; use canvas")
+        except InvalidTile:
+            self.reply(400, "text/plain", b"Invalid tile coordinates")
+        except StaleRevision:
+            self.reply(412, "text/plain", b"Preview revision changed")
+        except (TilesPending, RendererBusy):
+            self.reply(202, "text/plain", b"Preview updating")
+        except (OSError, ValueError, RecursionError):
+            self.reply(503, "text/plain", b"Viewport render unavailable")
+
     def reply(self, status, kind, data, etag=None, *, font_fallback=False, image_format=None, signature=None):
         self.send_response(status)
         self.send_header("Content-Length", str(len(data)))
@@ -380,7 +430,7 @@ class PreviewHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; "
+        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self' 'unsafe-inline'; "
                          "style-src 'unsafe-inline'; img-src blob:; connect-src 'self'; frame-ancestors 'none'")
         if etag is not None:
             self.send_header("ETag", etag)
@@ -425,6 +475,7 @@ class PreviewWindow:
         self.version = 0
         self.server = PreviewServer(("127.0.0.1", port), PreviewHandler)
         self.server.view = self
+        self.tiles = ViewportRenderer(source, generation=lambda: self.settings[1], cancelled=self.cancelled)
         self.host = f"127.0.0.1:{self.server.server_port}"
         self.thread = Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
         self.thread.start()
@@ -506,6 +557,7 @@ class PreviewWindow:
             if self.cancelled.is_set():
                 return
             self.cancelled.set()
+            self.tiles.close()
             self.server.shutdown()
             self.server.server_close()
             self.thread.join()
