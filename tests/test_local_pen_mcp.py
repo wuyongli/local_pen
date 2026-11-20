@@ -2,6 +2,7 @@ import json
 import base64
 import os
 import plistlib
+import re
 import select
 import struct
 import subprocess
@@ -164,6 +165,38 @@ class LocalPenMcpTest(unittest.TestCase):
         with self.assertRaises(URLError):
             urlopen(preview["url"], timeout=2)
 
+    def test_preview_tab_title_uses_task_name_and_escapes_html(self):
+        from html import escape
+        from urllib.request import urlopen
+        from pen_live_preview import PreviewWindow
+
+        for directory, expected in (("2026-11-20-产地通小程序", "产地通小程序"),
+                                    ("2026-11-20_采购 & <结算>", "采购 & <结算>")):
+            with self.subTest(directory=directory):
+                task = self.source.parent / directory
+                task.mkdir()
+                preview = PreviewWindow(self.source.resolve(), 1, task_dir=task)
+                try:
+                    with urlopen(preview.status()["url"], timeout=2) as response:
+                        page = response.read().decode("utf-8")
+                    self.assertEqual(re.search(r"<title>(.*?)</title>", page).group(1), f"{escape(expected)} · local_pen")
+                    self.assertNotIn("<结算>", page)
+                finally:
+                    preview.close()
+
+    def test_preview_tab_title_falls_back_to_design_name(self):
+        from urllib.request import urlopen
+        from pen_live_preview import PreviewWindow
+
+        for task in (None, self.source.parent / "2026-11-20"):
+            with self.subTest(task=task):
+                preview = PreviewWindow(self.source.resolve(), 1, **({"task_dir": task} if task else {}))
+                try:
+                    with urlopen(preview.status()["url"], timeout=2) as response:
+                        self.assertEqual(re.search(r"<title>(.*?)</title>", response.read().decode("utf-8")).group(1), "source · local_pen")
+                finally:
+                    preview.close()
+
     @unittest.skipUnless(os.name == "posix", "live preview requires POSIX")
     def test_live_preview_keeps_the_task_url_between_mcp_processes(self):
         from urllib.request import urlopen
@@ -177,6 +210,8 @@ class LocalPenMcpTest(unittest.TestCase):
         url = previous["structuredContent"]["url"]
         with urlopen(url, timeout=2) as response:
             self.assertEqual(response.status, 200)
+            title = f"<title>{directory.name} · local_pen</title>"
+            self.assertIn(title, response.read().decode("utf-8"))
         status = ("tools/call", {"name": "live_preview", "arguments": {"action": "status"}})
         current, updated = self.rpc(status, self.call("update_text", layer_id="heading", text="接手续改"),
                                     cwd=directory)
@@ -184,6 +219,8 @@ class LocalPenMcpTest(unittest.TestCase):
         self.assertEqual(current["structuredContent"]["url"], url)
         self.assertEqual(updated["structuredContent"]["preview_url"], url)
         self.assertIn("接手续改", self.source.read_text())
+        with urlopen(url, timeout=2) as response:
+            self.assertIn(title, response.read().decode("utf-8"))
 
         other_task = directory / "other-task"
         other_task.mkdir()
@@ -193,6 +230,8 @@ class LocalPenMcpTest(unittest.TestCase):
             "task_dir": str(other_task), "file_path": str(other_design),
         }}), start, cwd=other_task)
         self.assertNotEqual(other["structuredContent"]["url"], current["structuredContent"]["url"])
+        with urlopen(other["structuredContent"]["url"], timeout=2) as response:
+            self.assertIn("<title>other-task · local_pen</title>", response.read().decode("utf-8"))
 
     @unittest.skipUnless(os.name == "posix", "live preview requires POSIX")
     def test_default_edit_starts_preview_and_second_process_shares_it(self):
@@ -440,6 +479,18 @@ class LocalPenMcpTest(unittest.TestCase):
             urlopen(Request(url, headers={"If-Match": '"999"'}), timeout=2)
         self.assertEqual(missing_revision.exception.code, 412)
         self.assertEqual(renderer.call_count, 1)
+
+    def test_legacy_artboard_geometry_uses_export_scale_and_keeps_auto_size_unknown(self):
+        from pen_render import artboard_titles
+        layers = [
+            {'id':'bg','type':'rectangle','x':0,'y':0,'width':10000,'height':11250},
+            {'id':'wide','type':'frame','name':'宽画板','x':2000,'y':2000,'width':1600,'height':200},
+            {'id':'auto','type':'frame','name':'自适应','x':0,'y':0,'width':1200,'height':'fit_content'},
+        ]
+        wide, auto = artboard_titles(layers,.4)
+        self.assertEqual((wide['width'],wide['height']),(640,80))
+        self.assertEqual(auto['width'],480)
+        self.assertNotIn('height',auto)
 
     def test_live_canvas_reduces_scale_for_a_large_document(self):
         from pen_render import render_canvas_png

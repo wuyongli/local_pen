@@ -196,7 +196,9 @@ def artboard_titles(layers, scale):
     origin_y = min(position(layer, "y") for layer in visible)
     return [{"id": layer["id"], "name": layer["name"],
              "x": (position(layer, "x") - origin_x) * scale,
-             "y": (position(layer, "y") - origin_y) * scale}
+             "y": (position(layer, "y") - origin_y) * scale,
+             **{axis: layer[axis] * scale for axis in ("width", "height")
+                if number(layer.get(axis)) and layer[axis] > 0}}
             for layer in visible if layer.get("type") == "frame" and isinstance(layer.get("id"), str)
             and isinstance(layer.get("name"), str) and layer["name"].strip()]
 

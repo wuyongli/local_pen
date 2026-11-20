@@ -363,7 +363,7 @@ class ViewportRenderer:
                 or not 0 < bounds['width'] <= 1e7 or not 0 < bounds['height'] <= 1e7):
             raise ValueError('Invalid native layout')
         self.current = {**result['layout'], 'etag':'"'+sha256((self.nonce+repr(revision)).encode()).hexdigest()+'"',
-                        'tilePixels':TILE_PIXELS, 'padding':TILE_PADDING, 'minLevel':MIN_LEVEL, 'maxLevel':MAX_LEVEL,
+                        'documentKey':sha256(os.fsencode(self.source)).hexdigest(), 'tilePixels':TILE_PIXELS, 'padding':TILE_PADDING, 'minLevel':MIN_LEVEL, 'maxLevel':MAX_LEVEL,
                         'font_fallback':result.get('font_fallback', False)}
         self.current_revision = revision
         self.retry_after = 0

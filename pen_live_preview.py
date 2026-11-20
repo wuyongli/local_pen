@@ -11,6 +11,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from hashlib import sha256
+from html import escape
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,7 +30,7 @@ from pen_tiles import MIN_LEVEL, MAX_LEVEL, InvalidTile, NativeUnsupported, Rend
 PREVIEW_CONTROL = "/_local_pen_preview"
 SIGNATURE_HEADER = "X-Local-Pen-Signature"
 PREVIEW_IDLE_SECONDS = 600
-PREVIEW_VERSION = "1.21.0"
+PREVIEW_VERSION = "1.22.0"
 
 
 def control_signature(token, message):
@@ -50,6 +51,8 @@ PAGE = """<!doctype html>
              min-width: 100%; min-height: 100%; width: max-content; height: max-content; }
   #surface[data-pannable] { padding: max(50vh, 36px) max(50vw, 16px); }
   #scene { position: relative; }
+  #tile-world { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #previous-frame { position: absolute; pointer-events: none; }
   #tiles { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
   .tile { position: absolute; overflow: hidden; }
   .tile img { position: absolute; max-width: none; box-shadow: none; }
@@ -65,19 +68,36 @@ PAGE = """<!doctype html>
   button { color: inherit; font: inherit; background: transparent; border: none;
            border-radius: 4px; min-height: 34px; padding: 0 8px; cursor: pointer; }
   button:hover { background: #383d3a; }
+  #artboard-panel { position: fixed; top: 62px; right: 12px; width: min(320px, calc(100vw - 32px));
+                    box-sizing: border-box; padding: 12px; border: 1px solid #565c59; border-radius: 8px;
+                    background: #242726; box-shadow: 0 8px 32px #0006; }
+  #artboard-panel[hidden] { display: none; }
+  #artboard-panel h2 { margin: 0 0 8px; font-size: 14px; }
+  #board-search { box-sizing: border-box; width: 100%; padding: 9px; border: 1px solid #565c59;
+                  border-radius: 5px; background: #1e1e1e; color: inherit; font: inherit; }
+  #board-count { display: block; margin: 8px 0; color: #a9b3ae; font-size: 12px; }
+  #board-list { list-style: none; margin: 0; padding: 0; max-height: min(60vh, 520px); overflow: auto; }
+  #board-list button { width: 100%; text-align: left; overflow-wrap: anywhere; }
+  #board-list button[aria-current] { background: #34473f; }
   #zoom-level { min-width: 42px; text-align: center; font-variant-numeric: tabular-nums; }
   output { position: fixed; left: 16px; bottom: 16px; max-width: calc(100vw - 64px);
            padding: 7px 12px; background: #242726; border: 1px solid #565c59; border-radius: 6px; }
 </style>
 <main tabindex="0" aria-label="画板区域">
-  <div id="surface"><div id="scene"><img alt="实时画板" draggable="false" hidden><div id="tiles"></div><div id="artboard-titles"></div></div></div>
+  <div id="surface"><div id="scene"><img alt="实时画板" draggable="false" hidden><div id="tiles"><div id="tile-world"></div></div><div id="artboard-titles"></div></div></div>
 </main>
 <nav aria-label="画板缩放">
   <button type="button" aria-label="缩小" id="zoom-out">−</button>
-  <span id="zoom-level">100%</span>
+  <button type="button" id="zoom-level" aria-label="实际大小 100%" title="点击恢复实际大小（100%）">100%</button>
   <button type="button" aria-label="放大" id="zoom-in">+</button>
   <button type="button" id="fit">适合窗口</button>
+  <button type="button" id="boards-toggle" aria-label="画板目录" aria-expanded="false" aria-controls="artboard-panel">画板</button>
 </nav>
+<aside id="artboard-panel" aria-label="画板目录" hidden>
+  <h2>画板目录</h2>
+  <input id="board-search" type="search" aria-label="查找画板" placeholder="输入画板名称…" autocomplete="off">
+  <span id="board-count" role="status"></span><ul id="board-list"></ul>
+</aside>
 <output role="status">正在渲染画板…</output>
 <script>
 const viewport = document.querySelector('main');
@@ -96,6 +116,15 @@ let width = 0;
 let height = 0;
 let drag;
 let gestureRatio;
+let sceneBounds = {x: 0, y: 0};
+let viewDocumentKey = '';
+let viewPersistenceActive = true;
+let lastView;
+let lastViewport;
+let saveViewTimer;
+let directory = [];
+let selectedBoard;
+
 
 function viewportCenter() {
   const view = viewport.getBoundingClientRect();
@@ -124,6 +153,7 @@ function layout(anchor = [0.5, 0.5], point) {
   const [x, y] = point ?? viewportCenter();
   viewport.scrollLeft += image.left + image.width * anchor[0] - x;
   viewport.scrollTop += image.top + image.height * anchor[1] - y;
+  rememberView(true);
   window.dispatchEvent(new Event('local-pen-view-change'));
 }
 
@@ -134,6 +164,115 @@ function zoom(next, point) {
                          Math.max(1, viewport.offsetHeight - 52) / height);
   ratio = Math.max(0.25, Math.min(8 / fitted, next));
   layout(anchor, point);
+}
+
+function getViewState() {
+  if (!width || !height) return null;
+  const image = canvas.getBoundingClientRect();
+  const scale = image.width / width;
+  if (!(scale > 0)) return null;
+  const [x, y] = viewportCenter();
+  return {version: 1, x: sceneBounds.x + (x - image.left) / scale,
+          y: sceneBounds.y + (y - image.top) / scale, scale, fit: autoFit};
+}
+
+function validView(value) {
+  return value && value.version === 1 && typeof value.fit === 'boolean'
+    && ['x', 'y', 'scale'].every(key => typeof value[key] === 'number' && Number.isFinite(value[key]))
+    && Math.abs(value.x) < 1e9 && Math.abs(value.y) < 1e9 && value.scale > 0 && value.scale <= 8;
+}
+
+function saveView() {
+  clearTimeout(saveViewTimer);
+  if (!viewPersistenceActive || !viewDocumentKey || !validView(lastView)) return;
+  for (const name of ['sessionStorage', 'localStorage']) {
+    try { window[name].setItem('local-pen:camera:v1:' + viewDocumentKey, JSON.stringify(lastView)); }
+    catch { /* Viewing still works when browser storage is unavailable. */ }
+  }
+}
+
+function rememberView(force = false) {
+  if (!force && lastViewport && (lastViewport[0] !== viewport.clientWidth || lastViewport[1] !== viewport.clientHeight)) return;
+  const next = getViewState();
+  if (!next) return;
+  lastView = next;
+  lastViewport = [viewport.clientWidth, viewport.clientHeight];
+  clearTimeout(saveViewTimer);
+  saveViewTimer = setTimeout(saveView, 150);
+}
+
+function pauseViewPersistence() {
+  rememberView(true); saveView();
+  viewPersistenceActive = false;
+  clearTimeout(saveViewTimer);
+}
+
+function restoreView(value) {
+  autoFit = !validView(value) || value.fit;
+  const fitted = Math.min(1, Math.max(1, viewport.offsetWidth - 32) / width,
+                         Math.max(1, viewport.offsetHeight - 52) / height);
+  ratio = autoFit ? 1 : value.scale / fitted;
+  layout(autoFit ? undefined : [(value.x - sceneBounds.x) / width, (value.y - sceneBounds.y) / height]);
+}
+
+function updateViewDocument(next) {
+  viewPersistenceActive = true;
+  const key = next.documentKey || location.pathname;
+  let state = getViewState();
+  if (key !== viewDocumentKey) {
+    saveView();
+    state = null;
+    for (const name of ['sessionStorage', 'localStorage']) {
+      try {
+        const saved = JSON.parse(window[name].getItem('local-pen:camera:v1:' + key));
+        if (validView(saved)) { state = saved; break; }
+      } catch { /* Ignore stale or invalid saved positions. */ }
+    }
+    viewDocumentKey = key;
+    selectedBoard = undefined;
+  }
+  sceneBounds = next.bounds;
+  width = next.bounds.width;
+  height = next.bounds.height;
+  restoreView(state);
+}
+
+function renderDirectory() {
+  const tokens = document.querySelector('#board-search').value.trim().toLocaleLowerCase().split(/\\s+/).filter(Boolean);
+  const found = directory.filter(board => tokens.every(token => board.name.toLocaleLowerCase().includes(token)));
+  const list = document.createDocumentFragment();
+  for (const board of found.slice(0, 200)) {
+    const item = document.createElement('li');
+    const button = document.createElement('button');
+    button.type = 'button'; button.textContent = board.name;
+    if (board.id === selectedBoard) button.setAttribute('aria-current', 'true');
+    button.addEventListener('click', () => focusArtboard(board));
+    item.append(button); list.append(item);
+  }
+  document.querySelector('#board-list').replaceChildren(list);
+  document.querySelector('#board-count').textContent = !found.length ? '未找到画板'
+    : tokens.length ? `找到 ${found.length} 张画板${found.length > 200 ? '，请继续输入以缩小范围' : ''}`
+    : `${directory.length} 张画板${found.length > 200 ? '，输入名称查找更多' : ''}`;
+}
+
+function toggleDirectory(open) {
+  const panel = document.querySelector('#artboard-panel');
+  panel.hidden = !open;
+  document.querySelector('#boards-toggle').setAttribute('aria-expanded', String(open));
+  if (open) document.querySelector('#board-search').focus({preventScroll: true});
+}
+
+function focusArtboard(board) {
+  selectedBoard = board.id;
+  const sized = Number.isFinite(board.width) && board.width > 0 && Number.isFinite(board.height) && board.height > 0;
+  const bw = board.width, bh = board.height;
+  toggleDirectory(false);
+  restoreView({version: 1, fit: false, x: sceneBounds.x + board.x + (sized ? bw / 2 : 0),
+               y: sceneBounds.y + board.y + (sized ? bh / 2 : 0),
+               scale: sized ? Math.min(1, Math.max(1, viewport.clientWidth - 96) / bw,
+                                      Math.max(1, viewport.clientHeight - 96) / bh)
+                            : 1});
+  renderDirectory(); viewport.focus({preventScroll: true});
 }
 
 function showArtboardTitles(artboards) {
@@ -153,12 +292,30 @@ function showArtboardTitles(artboards) {
     labels.append(label);
   }
   titleLayer.replaceChildren(labels);
+  directory = artboards.filter(board => typeof board.name === 'string');
+  renderDirectory();
 }
 
 document.querySelector('#zoom-in').addEventListener('click', () => zoom(ratio * 1.25));
 document.querySelector('#zoom-out').addEventListener('click', () => zoom(ratio / 1.25));
 document.querySelector('#fit').addEventListener('click', () => { autoFit = true; ratio = 1; layout(); });
-window.addEventListener('resize', () => layout(imageAnchor()));
+document.querySelector('#zoom-level').addEventListener('click', () => {
+  const state = getViewState(); if (state) restoreView({...state, scale: 1, fit: false});
+});
+document.querySelector('#boards-toggle').addEventListener('click', () => toggleDirectory(document.querySelector('#artboard-panel').hidden));
+document.querySelector('#board-search').addEventListener('input', renderDirectory);
+window.addEventListener('resize', () => { if (width && height) restoreView(lastView || getViewState()); });
+viewport.addEventListener('scroll', () => rememberView(), {passive: true});
+window.addEventListener('pagehide', () => { rememberView(true); saveView(); });
+window.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && !document.querySelector('#artboard-panel').hidden) {
+    toggleDirectory(false); document.querySelector('#boards-toggle').focus({preventScroll: true}); return;
+  }
+  if (event.target.closest('input,textarea,[contenteditable="true"]')) return;
+  if (event.key === '/' || (event.key.toLowerCase() === 'k' && (event.metaKey || event.ctrlKey))) {
+    event.preventDefault(); toggleDirectory(true);
+  } else if (!event.metaKey && !event.ctrlKey && event.key === '1') document.querySelector('#zoom-level').click();
+});
 
 viewport.addEventListener('wheel', event => {
   if (!event.ctrlKey) return;
@@ -244,6 +401,7 @@ async function refresh() {
         const anchor = resized ? imageAnchor() : null;
         canvas.src = image.src;
         canvas.hidden = false;
+        window.dispatchEvent(new Event('local-pen-legacy-ready'));
         if (resized) {
           width = image.naturalWidth;
           height = image.naturalHeight;
@@ -357,7 +515,7 @@ class PreviewHandler(BaseHTTPRequestHandler):
         if path in (view.route, view.route + "canvas", view.route + "canvas.png", view.route + "artboards.json", view.route + "manifest.json", view.route + "tile.png"):
             view.last_activity = monotonic()
         if path == view.route:
-            self.reply(200, "text/html; charset=utf-8", PAGE)
+            self.reply(200, "text/html; charset=utf-8", view.page)
         elif path == view.route + "preview.js":
             self.reply(200, "text/javascript; charset=utf-8", Path(__file__).with_name("pen_preview.js").read_bytes())
         elif path in (view.route + "manifest.json", view.route + "tile.png"):
@@ -456,8 +614,12 @@ class PreviewServer(ThreadingHTTPServer):
 
 
 class PreviewWindow:
-    def __init__(self, source, scale, port=0, route_token=None, *, independent=False):
+    def __init__(self, source, scale, port=0, route_token=None, *, independent=False, task_dir=None):
         self.source = source
+        task_name = re.sub(r"^\d{4}-\d{2}-\d{2}[-_ ]*", "", Path(task_dir).name).strip() if task_dir is not None else ""
+        title = f"{escape(task_name or source.stem)} · local_pen"
+        self.page = PAGE.replace("<title>实时画板 · local_pen</title>".encode("utf-8"),
+                                 f"<title>{title}</title>".encode("utf-8"), 1)
         self.source_key = sha256(os.fsencode(source)).hexdigest()
         self.independent = independent
         self.last_activity = monotonic()
@@ -649,7 +811,7 @@ def serve_preview():
     directory = Path(arguments["directory"])
     try:
         window = PreviewWindow(Path(arguments["source"]), arguments["scale"],
-                               arguments["port"], arguments["token"], independent=True)
+                               arguments["port"], arguments["token"], independent=True, task_dir=directory)
     except OSError as error:
         print(json.dumps({"errno": error.errno}), flush=True)
         return

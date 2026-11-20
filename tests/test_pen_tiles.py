@@ -146,6 +146,7 @@ class ViewportTest(SessionFixture):
     def test_manifest_cache_and_stale_tile_rejection(self):
         from pen_tiles import StaleRevision
         v=self.viewport(); m=v.manifest()
+        self.assertEqual(len(m['documentKey']),64)
         first=v.tile(m['etag'],0,0,0)
         self.control(crash=True)
         self.assertEqual(first,v.tile(m['etag'],0,0,0))

@@ -76,13 +76,20 @@ async function main() {
       zoom(1/fitted);
     });
     const target=manifest.artboards.find(b=>b.id==='settle18') || manifest.artboards[0];
+    assert.ok(target.width>0 && target.height>0,'Native artboard geometry is missing');
+    await page.getByRole('button',{name:'画板目录',exact:true}).click();
+    await page.getByRole('searchbox',{name:'查找画板'}).fill(target.name);
+    await page.locator('#board-list').getByRole('button',{name:target.name,exact:true}).click();
+    assert.ok(await page.locator('#artboard-panel').isHidden());
+    assert.equal(await page.locator('[data-artboard-id]').count(),roots.length);
+    await page.getByRole('button',{name:'实际大小 100%',exact:true}).click();
     await page.evaluate(board=>{
       const rect=canvas.getBoundingClientRect();
       viewport.scrollLeft+=rect.left+board.x-100;
       viewport.scrollTop+=rect.top+board.y-100;
     },target);
     await page.waitForFunction(()=>{
-      const wanted=[...document.querySelectorAll('.tile')];
+      const wanted=[...document.querySelectorAll('.tile:not([hidden])')];
       return wanted.length>0 && wanted.every(n=>n.dataset.tile.startsWith('1:'));
     },null,{timeout:60000});
     assert.equal(await page.locator('#zoom-level').textContent(),'100%');
@@ -91,15 +98,12 @@ async function main() {
     async function sample() {
       return page.evaluate(() => {
         const x=105,y=400;
-        const tile=[...document.querySelectorAll('.tile')].reverse().find(n=>{
-          const b=n.getBoundingClientRect();return b.left<=x && b.top<=y && b.right>x && b.bottom>y;
-        });
-        if(!tile)throw new Error('Visible sample has no tile');
-        const image=tile.querySelector('img'), b=image.getBoundingClientRect();
-        const c=document.createElement('canvas');c.width=c.height=1;
-        const ctx=c.getContext('2d');
-        ctx.drawImage(image,(x-b.left)*image.naturalWidth/b.width,(y-b.top)*image.naturalHeight/b.height,1,1,0,0,1,1);
-        return [...ctx.getImageData(0,0,1,1).data];
+        const frame=document.querySelector('#tile-frame');
+        if(!frame || frame.hidden)throw new Error('Visible frame is unavailable');
+        const b=frame.getBoundingClientRect();
+        if(x<b.left || y<b.top || x>=b.right || y>=b.bottom)throw new Error('Sample is outside the visible frame');
+        return [...frame.getContext('2d').getImageData(
+          Math.floor((x-b.left)*frame.width/b.width),Math.floor((y-b.top)*frame.height/b.height),1,1).data];
       });
     }
     async function waitChanged(old) {
@@ -145,9 +149,15 @@ async function main() {
     assert.deepEqual(await sample(),[227,241,255,255]);
     assert.ok(requests.length>0);
     assert.deepEqual(errors,[]);
+    const savedView=await page.evaluate(()=>getViewState());
+    await page.waitForTimeout(200);await page.reload();
+    await page.waitForFunction(()=>document.querySelector('#tiles').dataset.ready,null,{timeout:60000});
+    const restoredView=await page.evaluate(()=>getViewState());
+    assert.equal(await page.locator('#zoom-level').textContent(),'100%');
+    assert.ok(Math.abs(savedView.x-restoredView.x)<1 && Math.abs(savedView.y-restoredView.y)<1);
     await page.screenshot({path:path.join(directory,'viewport.png')});
     const result={directory,url,artboards:roots.length,bounds:manifest.bounds,openedMs,refreshedMs,
-      tileRequests:requests.length,pageErrors:errors};
+      tileRequests:requests.length,pageErrors:errors,artboardSearch:true,cameraReload:true};
     await writeFile(path.join(directory,'results.json'),JSON.stringify(result,null,2));
     console.log(JSON.stringify(result));
     await second.tool('live_preview',{action:'stop'});active=undefined;

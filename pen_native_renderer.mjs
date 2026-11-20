@@ -48,7 +48,7 @@ globalThis[hook] = async (editor, decode, native) => {
         || Math.max(bounds.width,bounds.height) > 1e7) throw new Error('Unsupported canvas bounds');
     const artboards = roots().filter(n => n.type === 'frame').map(n => {
       const p = n[props].resolved, rect = n.getVisualWorldBounds();
-      return {id: n.id, name: p.name ?? '', x: rect.minX-b.minX, y: rect.minY-b.minY};
+      return {id: n.id, name: p.name ?? '', x: rect.minX-b.minX, y: rect.minY-b.minY, width: rect.width, height: rect.height};
     }).filter(n => typeof n.name === 'string' && n.name.trim());
     return {bounds, artboards};
   }
