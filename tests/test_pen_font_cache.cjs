@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const { spawnSync } = require("node:child_process");
-const { existsSync, mkdtempSync, readdirSync, rmSync, utimesSync } = require("node:fs");
+const { existsSync, mkdtempSync, readdirSync, rmSync, utimesSync, statSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { join, resolve } = require("node:path");
 const { test } = require("node:test");
@@ -8,6 +8,7 @@ const { test } = require("node:test");
 const preload = resolve(__dirname, "../pen_font_cache.cjs");
 const font = "https://fonts.gstatic.com/s/notosanssc/v39/k3kXo84MPvpLmixcA63oeALhKYiJ-Q7m8w.ttf";
 const icon = "https://unpkg.com/lucide-static@0.563.0/font/lucide.woff2";
+const fontEntries = directory => readdirSync(directory).filter(name => /^[a-f0-9]{64}$/.test(name));
 
 function useCache(run) {
     const directory = mkdtempSync(join(tmpdir(), "local-pen-test-fonts-"));
@@ -18,7 +19,7 @@ function useCache(run) {
     }
 }
 
-function fetchInChild(directory, { url = font, options, headers = {}, status = 200, size = 5, fail = false } = {}) {
+function fetchInChild(directory, { url = font, options, headers = {}, status = 200, size = 5, fail = false, offline = false, maxBytes, childTimeout = 10000 } = {}) {
     const request = JSON.stringify({ url, options, headers, status, size, fail });
     const result = spawnSync(process.execPath, ["-e", `
         const {url, options, headers, status, size, fail} = ${request};
@@ -49,8 +50,11 @@ function fetchInChild(directory, { url = font, options, headers = {}, status = 2
             console.log(JSON.stringify({ calls, bytes, status: response.status }));
         })().catch(error => { console.error(error); process.exitCode = 1; });
     `], {
-        encoding: "utf8",
-        env: { ...process.env, LOCAL_PEN_FONT_CACHE_DIR: directory },
+        encoding: "utf8", timeout: childTimeout,
+        env: { ...process.env, LOCAL_PEN_FONT_CACHE_DIR: directory,
+               LOCAL_PEN_OFFLINE: offline ? "1" : "0",
+               LOCAL_PEN_FONT_CACHE_MAX_BYTES: String(maxBytes || 256 * 1024 * 1024),
+               LOCAL_PEN_MISSING_RESOURCES: offline ? join(directory, "missing") : "" },
     });
     assert.equal(result.status, 0, result.stderr);
     return JSON.parse(result.stdout);
@@ -63,7 +67,7 @@ test("reuses the same public font bytes across CLI processes", () => useCache(di
         assert.equal(miss.calls, 1);
         assert.deepEqual(hit, { ...miss, calls: 0 });
     }
-    assert.equal(readdirSync(directory).length, 2);
+    assert.equal(fontEntries(directory).length, 2);
 }));
 
 test("passes unrelated requests, personalized requests and invalid responses through", () => useCache(directory => {
@@ -81,7 +85,7 @@ test("passes unrelated requests, personalized requests and invalid responses thr
         { status: 206 },
     ]) {
         assert.equal(fetchInChild(directory, request).calls, 1);
-        assert.equal(readdirSync(directory).length, 0);
+        assert.equal(fontEntries(directory).length, 0);
     }
     fetchInChild(directory);
     assert.equal(fetchInChild(directory, { options: { headers: { Range: "bytes=0-1" } } }).calls, 1);
@@ -91,15 +95,16 @@ test("a missing cache directory leaves normal fetch available", () => useCache(d
     assert.equal(fetchInChild(join(directory, "missing")).calls, 1);
 }));
 
-test("uses a previously validated font when the public download fails", () => useCache(directory => {
+test("all render modes reuse validated versioned fonts without online revalidation", () => useCache(directory => {
     const original = fetchInChild(directory, { size: 8 });
-    const [entry] = readdirSync(directory);
-    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    utimesSync(join(directory, entry), yesterday, yesterday);
-    assert.deepEqual(fetchInChild(directory, { fail: true }), original);
-    assert.deepEqual(fetchInChild(directory, { status: 503 }), original);
-    assert.equal(fetchInChild(directory, { status: 403 }).status, 403);
-    assert.notEqual(fetchInChild(directory, { size: 12 }).bytes, original.bytes);
+    const [entry] = fontEntries(directory);
+    const old = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    utimesSync(join(directory, entry), old, old);
+    const expected = { ...original, calls: 0 };
+    assert.deepEqual(fetchInChild(directory, { fail: true }), expected);
+    assert.deepEqual(fetchInChild(directory, { status: 503 }), expected);
+    assert.deepEqual(fetchInChild(directory, { status: 403 }), expected);
+    assert.deepEqual(fetchInChild(directory, { size: 12 }), expected);
 }));
 
 test("an isolated renderer flags a missing public font without fetching it", () => useCache(directory => {
@@ -137,4 +142,69 @@ test("the online preview tracks missing referenced images without treating unrel
         encoding: "utf8",
     });
     assert.equal(result.status, 0, result.stderr);
+}));
+
+test("offline rendering reuses pinned font bytes after a weekend without network access", () => useCache(directory => {
+    for (const url of [font, icon]) {
+        const original = fetchInChild(directory, { url, size: 8 });
+        const entry = require("node:crypto").createHash("sha256").update(url).digest("hex");
+        const old = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        utimesSync(join(directory, entry), old, old);
+        const hit = fetchInChild(directory, { url, offline: true, fail: true });
+        assert.deepEqual(hit, { ...original, calls: 0 });
+        assert.equal(existsSync(join(directory, "missing")), false);
+    }
+}));
+
+test("saving another font keeps older valid fonts when capacity is available", () => useCache(directory => {
+    const original = fetchInChild(directory, { size: 8 });
+    const entry = require("node:crypto").createHash("sha256").update(font).digest("hex");
+    const old = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    utimesSync(join(directory, entry), old, old);
+    fetchInChild(directory, { url: icon });
+    assert.ok(existsSync(join(directory, entry)), "A new download removed a usable old font");
+    assert.deepEqual(fetchInChild(directory, { offline: true, fail: true }), { ...original, calls: 0 });
+}));
+
+test("font cache evicts only the oldest entries needed to stay within its capacity", () => useCache(directory => {
+    const hash = url => require("node:crypto").createHash("sha256").update(url).digest("hex");
+    const urls = [40,41,42].map(v => font.replace("/v39/", `/v${v}/`));
+    for (const url of urls) fetchInChild(directory, { url, size: 20 * 1024 * 1024, maxBytes: 64 * 1024 * 1024 });
+    urls.forEach((url,i) => {
+        const age = new Date(Date.now() - (7-i) * 24 * 60 * 60 * 1000);
+        utimesSync(join(directory,hash(url)),age,age);
+    });
+    const next = font.replace("/v39/", "/v43/");
+    fetchInChild(directory, { url: next, size: 10 * 1024 * 1024, maxBytes: 64 * 1024 * 1024 });
+    assert.equal(existsSync(join(directory,hash(urls[0]))),false);
+    for (const url of [...urls.slice(1),next]) assert.ok(existsSync(join(directory,hash(url))));
+    const total = fontEntries(directory).reduce((bytes,file) => bytes + statSync(join(directory,file)).size,0);
+    assert.ok(total <= 64 * 1024 * 1024);
+}));
+
+
+test("new font versions download separately without replacing existing versions", () => useCache(directory => {
+    const first = fetchInChild(directory, { size: 8 });
+    const next = font.replace("/v39/", "/v40/");
+    const second = fetchInChild(directory, { url: next, size: 12 });
+    assert.equal(second.calls,1);
+    assert.notEqual(first.bytes,second.bytes);
+    assert.deepEqual(fetchInChild(directory, { fail: true }), { ...first, calls: 0 });
+    assert.equal(fontEntries(directory).length,2);
+}));
+
+test("a corrupt stored font is downloaded again and repaired", () => useCache(directory => {
+    const first = fetchInChild(directory, { size: 8 });
+    const [entry] = fontEntries(directory);
+    writeFileSync(join(directory,entry),Buffer.from("corrupt font"));
+    assert.deepEqual(fetchInChild(directory, { size: 8 }),first);
+    assert.deepEqual(fetchInChild(directory, { fail: true }),{...first,calls:0});
+}));
+
+
+test("an oversized uncached font response stays readable without blocking fetch", () => useCache(directory => {
+    const result = fetchInChild(directory, { size: 25 * 1024 * 1024, childTimeout: 1500 });
+    assert.equal(result.calls,1);
+    assert.equal(result.status,200);
+    assert.equal(fontEntries(directory).length,0);
 }));

@@ -2,6 +2,7 @@
 const { createHash, randomUUID } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
+const { spawn } = require("node:child_process");
 
 const directory = process.env.LOCAL_PEN_FONT_CACHE_DIR;
 const missingResources = process.env.LOCAL_PEN_MISSING_RESOURCES;
@@ -9,9 +10,10 @@ const offline = process.env.LOCAL_PEN_OFFLINE === "1";
 const previewImages = new Set(JSON.parse(process.env.LOCAL_PEN_PREVIEW_IMAGES || "[]"));
 // The CJK font is about 17 MiB after the HTTP content encoding is removed.
 const maxFontBytes = 24 * 1024 * 1024;
-const maxCacheBytes = 64 * 1024 * 1024;
-const maxAgeMs = 30 * 60 * 1000;
-const fallbackMaxAgeMs = 48 * 60 * 60 * 1000;
+const configuredBytes = Number(process.env.LOCAL_PEN_FONT_CACHE_MAX_BYTES);
+const maxCacheBytes = Number.isSafeInteger(configuredBytes) && configuredBytes >= 32 * 1024 * 1024
+    && configuredBytes <= 2048 * 1024 * 1024 ? configuredBytes : 256 * 1024 * 1024;
+const minCacheLifetimeMs = 30 * 60 * 1000;
 const downloadTimeoutMs = 4000;
 const originalFetch = globalThis.fetch;
 const fontTypes = {
@@ -34,12 +36,18 @@ function publicFont(input, init) {
     if (google || lucide) return url;
 }
 
-function readFont(file, magic, ageLimit = maxAgeMs) {
+function readFont(file, magic) {
     try {
-        const stat = fs.statSync(file);
-        if (Date.now() - stat.mtimeMs >= ageLimit || stat.size > maxFontBytes) return;
+        const stat = fs.lstatSync(file);
+        if (!stat.isFile() || stat.size < 4 || stat.size > maxFontBytes) return;
         const data = fs.readFileSync(file);
-        if (data.subarray(0, 4).toString("latin1") === magic) return data;
+        if (data.subarray(0, 4).toString("latin1") === magic) {
+            // Coarse access tracking keeps frequently used fonts during capacity eviction.
+            if (Date.now() - stat.mtimeMs > 60000) {
+                try { fs.utimesSync(file, stat.atime, new Date()); } catch { /* Read-only entries remain usable. */ }
+            }
+            return data;
+        }
     } catch {
         // A missing or unavailable cache should leave the CLI's fetch available.
     }
@@ -54,7 +62,7 @@ function cacheableResponse(response, url, contentType) {
     const maxAge = controls.find(value => value.startsWith("max-age="));
     const age = Number(response.headers.get("age") ?? "0");
     return controls.includes("public") && !controls.some(value => /^no-(cache|store)|^private/.test(value))
-        && Number(maxAge?.slice(8)) - age >= maxAgeMs / 1000
+        && Number(maxAge?.slice(8)) - age >= minCacheLifetimeMs / 1000
         && Number(response.headers.get("content-length") ?? "0") <= maxFontBytes;
 }
 
@@ -63,25 +71,37 @@ async function saveFont(file, response, magic) {
     try {
         const chunks = [];
         let size = 0;
-        for await (const chunk of response.body) {
-            size += chunk.length;
-            if (size > maxFontBytes) return;
-            chunks.push(chunk);
+        const reader = response.body.getReader();
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                size += value.length;
+                if (size > maxFontBytes) {
+                    // Awaiting tee cancellation would wait for the caller's branch,
+                    // which cannot be consumed until this cache attempt returns.
+                    void reader.cancel().catch(() => {});
+                    return;
+                }
+                chunks.push(value);
+            }
+        } finally {
+            reader.releaseLock();
         }
         const data = Buffer.concat(chunks, size);
         if (data.subarray(0, 4).toString("latin1") !== magic) return;
-        let occupied = 0;
-        for (const entry of fs.readdirSync(directory)) {
-            if (!/^[a-f0-9]{64}$/.test(entry)) continue;
-            const candidate = path.join(directory, entry);
-            const stat = fs.statSync(candidate);
-            if (Date.now() - stat.mtimeMs >= fallbackMaxAgeMs) fs.unlinkSync(candidate);
-            else if (candidate !== file) occupied += stat.size;
-        }
-        if (occupied + size > maxCacheBytes) return;
-        temporary = path.join(directory, randomUUID());
+        temporary = path.join(directory, "font-download-" + randomUUID());
         fs.writeFileSync(temporary, data, { flag: "wx", mode: 0o600 });
-        fs.renameSync(temporary, file);
+        // Python is already required by local_pen. Its shared flock protects both
+        // migration and publication without adding a native Node dependency.
+        await new Promise((resolve, reject) => {
+            const child = spawn(process.env.LOCAL_PEN_CACHE_PYTHON || "python3",
+                ["-B", path.join(__dirname, "pen_font_library.py"), "store", directory,
+                 temporary, path.basename(file), String(maxCacheBytes)], { stdio: "ignore" });
+            const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("Font store timed out")); }, 5000);
+            child.once("error", error => { clearTimeout(timer); reject(error); });
+            child.once("exit", code => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error("Font store failed")); });
+        });
         temporary = undefined;
     } catch {
         // Cache failures must not affect an in-flight render.
@@ -120,7 +140,8 @@ if (directory && originalFetch) {
         }
         const [contentType, magic] = fontTypes[path.extname(url.pathname).slice(1)];
         const file = path.join(directory, createHash("sha256").update(url.href).digest("hex"));
-        const data = readFont(file, magic, offline ? fallbackMaxAgeMs : maxAgeMs);
+        // Whitelisted URLs identify fixed font versions; all render paths share them.
+        const data = readFont(file, magic);
         if (data) return new Response(data, { headers: { "content-type": contentType } });
         if (offline && missingResources) {
             markMissingResource("font");
@@ -134,7 +155,7 @@ if (directory && originalFetch) {
         try {
             response = await originalFetch.call(this, input, { ...init, signal });
         } catch (error) {
-            const fallback = !init?.signal?.aborted && readFont(file, magic, fallbackMaxAgeMs);
+            const fallback = !init?.signal?.aborted && readFont(file, magic);
             if (fallback) return new Response(fallback, { headers: { "content-type": contentType } });
             if (missingResources && !init?.signal?.aborted) markMissingResource();
             throw error;
@@ -143,13 +164,13 @@ if (directory && originalFetch) {
         }
         if (!response.ok) {
             const fallback = (response.status === 429 || response.status >= 500)
-                && readFont(file, magic, fallbackMaxAgeMs);
+                && readFont(file, magic);
             if (fallback) return new Response(fallback, { headers: { "content-type": contentType } });
             if (missingResources) markMissingResource();
         }
         if (cacheableResponse(response, url, contentType)) {
             // Preserve the CLI's original response while storing a complete copy.
-            void saveFont(file, response.clone(), magic).catch(() => {});
+            await saveFont(file, response.clone(), magic);
         }
         return response;
     };

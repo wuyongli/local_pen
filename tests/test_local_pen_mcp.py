@@ -27,12 +27,14 @@ def png_size(data):
 
 @unittest.skipUnless(os.name == "posix", "private cache uses POSIX ownership and permissions")
 class FontCacheDirectoryTest(unittest.TestCase):
-    def cache_path(self, temporary):
+    def cache_path(self, temporary, **settings):
         return subprocess.check_output(
             [sys.executable, "-B", "-c",
              "from pen_render import renderer_environment; "
              "print((renderer_environment() or {}).get('LOCAL_PEN_FONT_CACHE_DIR', ''))"],
-            cwd=SERVER.parent, env={**os.environ, "TMPDIR": temporary}, text=True,
+            cwd=SERVER.parent, env={**os.environ, "TMPDIR": temporary,
+                                    "LOCAL_PEN_FONT_LIBRARY_DIR": str(Path(temporary) / "library"), **settings},
+            text=True, stderr=subprocess.PIPE,
         ).strip()
 
     def test_independent_servers_reuse_private_font_directory(self):
@@ -53,6 +55,91 @@ class FontCacheDirectoryTest(unittest.TestCase):
             target.mkdir(mode=0o700)
             cache.symlink_to(target, target_is_directory=True)
             self.assertNotIn(self.cache_path(temporary), {str(cache), str(target)})
+
+
+    def test_font_library_survives_changes_to_the_temporary_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            first = Path(self.cache_path(temporary))
+            self.assertEqual(first, Path(temporary) / "library")
+            other = Path(temporary) / "new-runtime"
+            other.mkdir()
+            self.assertEqual(Path(self.cache_path(temporary, TMPDIR=str(other))), first)
+
+    def test_font_library_migrates_valid_legacy_fonts_without_removing_originals(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            legacy = Path(temporary) / f"local-pen-public-fonts-v1-{os.getuid()}"
+            legacy.mkdir(mode=0o700)
+            font = legacy / ("a" * 64)
+            font.write_bytes(b"\x00\x01\x00\x00font")
+            font.chmod(0o600)
+            (legacy / ("b" * 64)).write_bytes(b"not a font")
+            (legacy / ("c" * 64)).symlink_to(font)
+            library = Path(self.cache_path(temporary))
+            self.assertEqual((library / font.name).read_bytes(), font.read_bytes())
+            self.assertTrue(font.is_file())
+            self.assertFalse((library / ("b" * 64)).exists())
+            self.assertFalse((library / ("c" * 64)).exists())
+            self.assertEqual((library / font.name).stat().st_mode & 0o777, 0o600)
+            font.unlink()
+            self.assertEqual((Path(self.cache_path(temporary)) / font.name).read_bytes(), b"\x00\x01\x00\x00font")
+
+    def test_font_library_does_not_import_an_accessible_legacy_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            legacy = Path(temporary) / f"local-pen-public-fonts-v1-{os.getuid()}"
+            legacy.mkdir(mode=0o755)
+            (legacy / ("a" * 64)).write_bytes(b"\x00\x01\x00\x00font")
+            library = Path(self.cache_path(temporary))
+            self.assertFalse((library / ("a" * 64)).exists())
+
+    def test_font_library_rejects_a_relative_override(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.cache_path(temporary, LOCAL_PEN_FONT_LIBRARY_DIR="relative-library")
+
+    def test_font_library_capacity_is_configured_for_the_renderer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            env = {**os.environ, "TMPDIR": temporary,
+                   "LOCAL_PEN_FONT_LIBRARY_DIR": str(Path(temporary) / "library"),
+                   "LOCAL_PEN_FONT_CACHE_MAX_MB": "64"}
+            code = "from pen_render import renderer_environment; print(renderer_environment()['LOCAL_PEN_FONT_CACHE_MAX_BYTES'])"
+            output = subprocess.check_output([sys.executable, "-B", "-c", code], cwd=SERVER.parent, env=env, text=True)
+            self.assertEqual(int(output), 64 * 1024 * 1024)
+
+
+    def test_parallel_migration_and_font_writes_respect_the_shared_capacity(self):
+        for other_mode in ("store", "migrate"):
+            with self.subTest(other_mode=other_mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                library = root / "library"
+                library.mkdir(mode=0o700)
+                legacy = root / "legacy"
+                legacy.mkdir(mode=0o700)
+                inputs = [library / "font-download-a", library / "font-download-b"]
+                for file in inputs:
+                    file.write_bytes(b"\x00\x01\x00\x00" + bytes(20 * 1024 * 1024 - 4))
+                if other_mode == "migrate":
+                    inputs[1].rename(legacy / ("b" * 64))
+                script = (
+                    "import os,sys,time; from pathlib import Path; import pen_font_library as lib; "
+                    "replace=os.replace; link=os.link; "
+                    "os.replace=lambda *a,**k:(time.sleep(.25),replace(*a,**k))[1]; "
+                    "os.link=lambda *a,**k:(time.sleep(.25),link(*a,**k))[1]; "
+                    "cache,source,key,mode=sys.argv[1:]; "
+                    "lib.store_font(cache,source,key,32*1024*1024) if mode=='store' "
+                    "else lib.migrate_font_cache(Path(cache),Path(source),32*1024*1024)"
+                )
+                cases = [(inputs[0], "a" * 64, "store"),
+                         (inputs[1] if other_mode == "store" else legacy, "b" * 64, other_mode)]
+                children = [subprocess.Popen([sys.executable, "-B", "-c", script, str(library), str(source), key, mode],
+                                             cwd=SERVER.parent, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            for source, key, mode in cases]
+                for child in children:
+                    _, errors = child.communicate(timeout=10)
+                    self.assertEqual(child.returncode, 0, errors.decode())
+                stored = [p for p in library.iterdir() if re.fullmatch(r"[a-f0-9]{64}", p.name)]
+                self.assertTrue(stored)
+                self.assertLessEqual(sum(p.stat().st_size for p in stored), 32 * 1024 * 1024)
+
 
 
 class LocalPenMcpTest(unittest.TestCase):
@@ -683,6 +770,51 @@ class LocalPenMcpTest(unittest.TestCase):
                 expected = {"cached": [True], "font-miss": [True, False], "remote-image": [False],
                             "unavailable": [True, False]}
                 self.assertEqual(calls, expected[scenario])
+
+    @unittest.skipUnless(sys.platform == "darwin", "local render isolation is provided by macOS")
+    def test_ai_png_preview_uses_local_render_when_online_export_would_time_out(self):
+        from pen_render import PNG_END, PNG_HEADER, preview_png
+
+        png = PNG_HEADER + struct.pack(">II", 80, 60) + b"preview data" + PNG_END
+        calls = []
+
+        def render(command, timeout, request, *, env=None):
+            local = command[0] == "/usr/bin/sandbox-exec"
+            calls.append(local)
+            if not local:
+                raise ValueError("Pen CLI timed out during PNG export")
+            self.assertEqual(env["LOCAL_PEN_OFFLINE"], "1")
+            Path(command[command.index("--export") + 1]).write_bytes(png)
+            return 0
+
+        with patch("pen_render.run_renderer", side_effect=render), patch("pen_render.renderer_command", return_value=["pen"]):
+            metadata, data = preview_png(str(self.source), "frame", refresh=True)
+        self.assertEqual(calls, [True])
+        self.assertEqual(data, png)
+        self.assertEqual((metadata["width"], metadata["height"]), (80, 60))
+
+    @unittest.skipUnless(sys.platform == "darwin", "local render isolation is provided by macOS")
+    def test_ai_png_preview_can_fall_back_when_local_resources_are_missing(self):
+        from pen_render import PNG_END, PNG_HEADER, preview_png
+
+        png = PNG_HEADER + struct.pack(">II", 80, 60) + b"preview data" + PNG_END
+        calls = []
+
+        def render(command, timeout, request, *, env=None):
+            local = command[0] == "/usr/bin/sandbox-exec"
+            calls.append(local)
+            output = Path(command[command.index("--export") + 1])
+            output.write_bytes(png)
+            if local:
+                Path(env["LOCAL_PEN_MISSING_RESOURCES"]).write_text("font\n")
+            else:
+                self.assertNotIn("LOCAL_PEN_OFFLINE", env or {})
+            return 0
+
+        with patch("pen_render.run_renderer", side_effect=render), patch("pen_render.renderer_command", return_value=["pen"]):
+            _, data = preview_png(str(self.source), "frame", refresh=True)
+        self.assertEqual(calls, [True, False])
+        self.assertEqual(data, png)
 
     def test_task_design_persists_and_keeps_tasks_separate(self):
         tasks = [self.source.parent / name for name in ("first", "second")]

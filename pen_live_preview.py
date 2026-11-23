@@ -30,7 +30,7 @@ from pen_tiles import MIN_LEVEL, MAX_LEVEL, InvalidTile, NativeUnsupported, Rend
 PREVIEW_CONTROL = "/_local_pen_preview"
 SIGNATURE_HEADER = "X-Local-Pen-Signature"
 PREVIEW_IDLE_SECONDS = 600
-PREVIEW_VERSION = "1.22.0"
+PREVIEW_VERSION = "1.22.1"
 
 
 def control_signature(token, message):

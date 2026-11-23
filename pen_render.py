@@ -7,21 +7,20 @@ import os
 import re
 import shutil
 import signal
-import stat
 import struct
 import subprocess
 import sys
 from collections import OrderedDict, deque
 from contextlib import nullcontext
-from functools import lru_cache
 from pathlib import Path
-from tempfile import NamedTemporaryFile, TemporaryDirectory, gettempdir
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from time import monotonic
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
 from edit_pen_text import load_pen, walk_layers, write_pen_copy
 from pen_design import absolute_path, layer_index, number, select
+from pen_font_library import font_cache_directory, font_cache_limit
 
 
 PNG_HEADER = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
@@ -56,23 +55,6 @@ def renderer_command():
     return [node, cli] if node else [cli]
 
 
-@lru_cache(maxsize=1)
-def session_font_cache():
-    return TemporaryDirectory(prefix="local-pen-fonts-")
-
-
-def font_cache_directory():
-    if hasattr(os, "getuid"):
-        uid = os.getuid()
-        cache = Path(gettempdir()) / f"local-pen-public-fonts-v1-{uid}"
-        try:
-            cache.mkdir(mode=0o700, exist_ok=True)
-            info = cache.lstat()
-            if stat.S_ISDIR(info.st_mode) and info.st_uid == uid and stat.S_IMODE(info.st_mode) == 0o700:
-                return str(cache)
-        except OSError:
-            pass
-    return session_font_cache().name
 
 
 def renderer_environment():
@@ -86,6 +68,8 @@ def renderer_environment():
     option = f"--require {json.dumps(str(FONT_CACHE_PRELOAD), ensure_ascii=False)}"
     env["NODE_OPTIONS"] = f"{env.get('NODE_OPTIONS', '')} {option}".strip()
     env["LOCAL_PEN_FONT_CACHE_DIR"] = directory
+    env["LOCAL_PEN_FONT_CACHE_MAX_BYTES"] = str(font_cache_limit())
+    env["LOCAL_PEN_CACHE_PYTHON"] = sys.executable
     return env
 
 
@@ -470,7 +454,8 @@ def preview_png(file_path, layer_id, scale=1, refresh=False, *, request=None):
         _, metadata, data = saved
         return {**metadata, "cached": True}, data
 
-    metadata, data = render_staged_png(source, staged, layer, scale, PREVIEW_PIXEL_LIMIT, PREVIEW_BYTE_LIMIT, 45, request)
+    metadata, data = render_staged_png(source, staged, layer, scale, PREVIEW_PIXEL_LIMIT, PREVIEW_BYTE_LIMIT, 45, request,
+                                      prefer_local=True)
     check_cancelled(request)
     if key is not None and key == preview_cache_key(source, staged, scale):
         PREVIEW_CACHE[key] = (monotonic(), metadata, data)
